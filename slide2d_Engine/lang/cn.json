@@ -412,5 +412,20 @@
   "assistant.asset_count": "已选择 {value} 个素材",
   "assistant.no_selection": "请至少选择两个物体",
   "assistant.cleared": "当前场景物体已清空",
-  "assistant.screenshot_saved": "画布截图已保存：{value}"
+  "assistant.screenshot_saved": "画布截图已保存：{value}",
+  "scene.manager": "Slide2D Scene Manager",
+  "scene.new": "新建空白场景",
+  "scene.new_category": "新建分类文件夹",
+  "scene.rename": "重命名场景",
+  "scene.duplicate": "复制场景",
+  "scene.delete": "删除场景",
+  "scene.set_startup": "设为启动场景",
+  "scene.export": "导出独立场景",
+  "scene.move_category": "移动到当前分类",
+  "scene.snapshot": "保存当前视角快照",
+  "scene.default_name": "新场景",
+  "scene.rename_title": "Slide2D Scene Manager - 重命名场景",
+  "scene.cannot_delete_last": "工程必须至少保留一个场景",
+  "scene.name_exists": "场景名称已存在",
+  "scene.double_click": "双击场景切换画布"
 }

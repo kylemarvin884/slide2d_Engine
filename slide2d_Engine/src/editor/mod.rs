@@ -1203,17 +1203,27 @@ fn draw_assistant_toolkit(
             ui.heading(tr("assistant.assets"));
             ui.label(tr("assistant.select_assets"));
             let candidates = collect_batch_assets(asset_library);
-            egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
-                for path in candidates {
-                    let mut selected = app_state.assistant_selected_assets.contains(&path);
-                    let label = path.strip_prefix(&app_state.project_root)
-                        .unwrap_or(&path).display().to_string();
-                    if ui.checkbox(&mut selected, label).changed() {
-                        if selected { app_state.assistant_selected_assets.push(path); }
-                        else { app_state.assistant_selected_assets.retain(|selected_path| selected_path != &path); }
+            egui::ScrollArea::vertical()
+                .max_height(130.0)
+                .show(ui, |ui| {
+                    for path in candidates {
+                        let mut selected = app_state.assistant_selected_assets.contains(&path);
+                        let label = path
+                            .strip_prefix(&app_state.project_root)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string();
+                        if ui.checkbox(&mut selected, label).changed() {
+                            if selected {
+                                app_state.assistant_selected_assets.push(path);
+                            } else {
+                                app_state
+                                    .assistant_selected_assets
+                                    .retain(|selected_path| selected_path != &path);
+                            }
+                        }
                     }
-                }
-            });
+                });
             ui.label(tr_args(
                 "assistant.asset_count",
                 &[(
@@ -1466,7 +1476,7 @@ fn batch_rename_assets(
     app_state: &mut AppState,
     asset_library: &mut AssetLibrary,
 ) -> Result<String, String> {
-    let base = app_state.assistant_batch_name.trim();
+    let base = app_state.assistant_batch_name.trim().to_owned();
     if base.is_empty() {
         return Err("Slide2D Assistant Toolkit: empty batch name".to_owned());
     }
@@ -1482,7 +1492,11 @@ fn batch_rename_assets(
             .and_then(|value| value.to_str())
             .unwrap_or("");
         let new_name = format!("{}_{:03}.{}", base, index + 1, extension);
-        renamed.push(crate::assets::rename_resource(path, &new_name)?);
+        let old_relative = project_relative_asset_path(path);
+        let output = crate::assets::rename_resource(path, &new_name)?;
+        let new_relative = project_relative_asset_path(&output);
+        replace_asset_references(app_state, &old_relative, &new_relative);
+        renamed.push(output);
     }
     app_state.assistant_selected_assets = renamed;
     asset_library.refresh();
@@ -1490,6 +1504,60 @@ fn batch_rename_assets(
         "Slide2D Assistant Toolkit: renamed {} assets",
         app_state.assistant_selected_assets.len()
     ))
+}
+
+/// 批量改名后同步当前场景、其他场景和UI中的图片或动画路径。
+fn replace_asset_references(app_state: &mut AppState, old_path: &str, new_path: &str) {
+    for object in &mut app_state.game_objects {
+        replace_object_asset_reference(object, old_path, new_path);
+    }
+    for element in &mut app_state.ui_elements {
+        if let UiElementKind::ImagePanel { image_path } = &mut element.kind {
+            if image_path == old_path {
+                *image_path = new_path.to_owned();
+            }
+        }
+    }
+    for scene in &mut app_state.project_scenes {
+        for object in &mut scene.game_objects {
+            replace_object_asset_reference(object, old_path, new_path);
+        }
+        for element in &mut scene.ui_elements {
+            if let UiElementKind::ImagePanel { image_path } = &mut element.kind {
+                if image_path == old_path {
+                    *image_path = new_path.to_owned();
+                }
+            }
+        }
+    }
+}
+
+/// 替换一个Actor及其常用蓝图节点中的资源路径。
+fn replace_object_asset_reference(object: &mut GameObject, old_path: &str, new_path: &str) {
+    if object.image_path == old_path {
+        object.image_path = new_path.to_owned();
+    }
+    if object.animation_path == old_path {
+        object.animation_path = new_path.to_owned();
+    }
+    if object.audio_path == old_path {
+        object.audio_path = new_path.to_owned();
+    }
+    for node in &mut object.blueprint.nodes {
+        match &mut node.kind {
+            crate::blueprint::model::BlueprintNodeKind::SwitchAnimation { animation_path }
+                if animation_path == old_path =>
+            {
+                *animation_path = new_path.to_owned()
+            }
+            crate::blueprint::model::BlueprintNodeKind::PlaySound { path, .. }
+                if path == old_path =>
+            {
+                *path = new_path.to_owned()
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 批量缩小所选PNG并使用PNG编码保存，透明通道保持不变。
@@ -4378,9 +4446,11 @@ fn instantiate_actor_asset(
         blueprint: actor.blueprint,
         blueprint_file: format!("blueprint_{id}.json"),
         variables: actor.variables,
+        persistent: false,
     };
     app_state.game_objects.push(object);
     app_state.selected_object_id = Some(id);
+    app_state.selected_object_ids = vec![id];
     app_state.selected_ui_id = None;
     app_state.next_object_id += 1;
     app_state.next_layer_index += 1;
@@ -4406,6 +4476,7 @@ fn apply_animation_asset_drop(
         object.animation_path = relative_animation;
         object.animation_playing = true;
         app_state.selected_object_id = Some(id);
+        app_state.selected_object_ids = vec![id];
         return Ok(id);
     }
     let animation = crate::animation::SpriteAnimation::load(animation_path)?;
@@ -4464,6 +4535,7 @@ fn handle_ui_interaction(ui: &egui::Ui, canvas_rect: Rect, app_state: &mut AppSt
         if let Some(id) = hit {
             app_state.selected_ui_id = Some(id);
             app_state.selected_object_id = None;
+            app_state.selected_object_ids.clear();
             app_state.blueprint_ui_id = Some(id);
             app_state.blueprint_object_id = None;
             app_state.blueprint_tab_active =
@@ -4477,6 +4549,7 @@ fn handle_ui_interaction(ui: &egui::Ui, canvas_rect: Rect, app_state: &mut AppSt
         if let Some(id) = hit {
             app_state.selected_ui_id = Some(id);
             app_state.selected_object_id = None;
+            app_state.selected_object_ids.clear();
         } else {
             app_state.selected_ui_id = None;
             return false;
@@ -4687,7 +4760,11 @@ fn draw_tile_map(
             if app_state.assistant_settings.show_tile_colliders
                 && (layer.kind == TileLayerKind::Collision || property_collision)
             {
-                painter.rect_stroke(rect, 0.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 70, 70)));
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(2.0_f32, Color32::from_rgb(255, 70, 70)),
+                );
             }
         }
     }
@@ -5019,6 +5096,22 @@ fn draw_canvas_rulers(
     );
     painter.rect_filled(
         Rect::from_min_max(
+            Pos2::new(canvas_rect.left(), canvas_rect.bottom() - ruler_size),
+            canvas_rect.max,
+        ),
+        0.0,
+        background,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(canvas_rect.right() - ruler_size, canvas_rect.top()),
+            canvas_rect.max,
+        ),
+        0.0,
+        background,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
             canvas_rect.min,
             Pos2::new(canvas_rect.left() + ruler_size, canvas_rect.bottom()),
         ),
@@ -5033,6 +5126,13 @@ fn draw_canvas_rulers(
             [
                 Pos2::new(x, canvas_rect.top()),
                 Pos2::new(x, canvas_rect.top() + 7.0),
+            ],
+            Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(x, canvas_rect.bottom()),
+                Pos2::new(x, canvas_rect.bottom() - 7.0),
             ],
             Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
         );
@@ -5052,6 +5152,13 @@ fn draw_canvas_rulers(
             [
                 Pos2::new(canvas_rect.left(), y),
                 Pos2::new(canvas_rect.left() + 7.0, y),
+            ],
+            Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(canvas_rect.right(), y),
+                Pos2::new(canvas_rect.right() - 7.0, y),
             ],
             Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
         );

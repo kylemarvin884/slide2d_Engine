@@ -119,6 +119,9 @@ pub struct Slide2dProject {
     pub startup_scene_name: String,
     pub active_scene_name: String,
     pub scenes: Vec<Scene>,
+    /// Scene Manager自定义分类文件夹。
+    #[serde(default = "default_scene_categories")]
+    pub scene_categories: Vec<String>,
     #[serde(default)]
     pub global_variables: HashMap<String, f32>,
     #[serde(default)]
@@ -149,6 +152,11 @@ fn default_performance_settings() -> PerformanceSettings {
 /// 旧工程没有辅助工具字段时使用默认设置。
 fn default_assistant_settings() -> AssistantSettings {
     AssistantSettings::new()
+}
+
+/// 旧工程使用的默认场景分类。
+fn default_scene_categories() -> Vec<String> {
+    vec!["Main Menu".to_owned(), "Levels".to_owned(), "Ending".to_owned()]
 }
 
 /// 把缺少扩展名的路径自动补成.slide2d。
@@ -198,6 +206,7 @@ pub fn save_project(app_state: &mut AppState, path: &Path) -> Result<(), String>
         startup_scene_name: app_state.startup_scene_name.clone(),
         active_scene_name: app_state.active_scene_name().to_owned(),
         scenes: app_state.project_scenes.clone(),
+        scene_categories: app_state.scene_categories.clone(),
         global_variables: app_state.global_variables.clone(),
         assets,
         asset_directories,
@@ -249,6 +258,7 @@ pub fn save_project_folder(app_state: &mut AppState, folder: &Path) -> Result<()
         startup_scene_name: app_state.startup_scene_name.clone(),
         active_scene_name: app_state.active_scene_name().to_owned(),
         scenes: app_state.project_scenes.clone(),
+        scene_categories: app_state.scene_categories.clone(),
         global_variables: app_state.global_variables.clone(),
         assets: Vec::new(),
         asset_directories: collect_directories(&folder.join("Content"), folder)?,
@@ -298,6 +308,7 @@ pub fn open_project_folder(folder: &Path) -> Result<AppState, String> {
         .unwrap_or(0);
     let mut state = AppState::from_scene(project.scenes[active_index].clone());
     state.project_scenes = project.scenes;
+    state.scene_categories = project.scene_categories;
     state.active_scene_index = active_index;
     state.startup_scene_name = project.startup_scene_name;
     state.global_variables = project.global_variables;
@@ -378,6 +389,7 @@ fn restore_project_to_folder(project: Slide2dProject, folder: &Path) -> Result<A
         .unwrap_or(0);
     let mut state = AppState::from_scene(project.scenes[active_index].clone());
     state.project_scenes = project.scenes;
+    state.scene_categories = project.scene_categories;
     state.active_scene_index = active_index;
     state.startup_scene_name = project.startup_scene_name;
     state.global_variables = project.global_variables;
@@ -484,6 +496,7 @@ pub fn open_project(path: &Path) -> Result<AppState, String> {
         .unwrap_or(0);
     let mut state = AppState::from_scene(project.scenes[active_index].clone());
     state.project_scenes = project.scenes;
+    state.scene_categories = project.scene_categories;
     state.active_scene_index = active_index;
     state.startup_scene_name = project.startup_scene_name;
     state.global_variables = project.global_variables;

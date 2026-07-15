@@ -547,6 +547,7 @@ pub fn update_ui_blueprints_with_state(
             blueprint: element.blueprint.clone(),
             blueprint_file: String::new(),
             variables: HashMap::new(),
+            persistent: false,
         };
         commands.extend(update_blueprints_with_state(
             std::slice::from_mut(&mut virtual_object),

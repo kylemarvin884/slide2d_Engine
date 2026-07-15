@@ -412,5 +412,20 @@
   "assistant.asset_count": "{value} assets selected",
   "assistant.no_selection": "Select at least two objects",
   "assistant.cleared": "All objects were cleared from the current scene",
-  "assistant.screenshot_saved": "Canvas screenshot saved: {value}"
+  "assistant.screenshot_saved": "Canvas screenshot saved: {value}",
+  "scene.manager": "Slide2D Scene Manager",
+  "scene.new": "New Empty Scene",
+  "scene.new_category": "New Category Folder",
+  "scene.rename": "Rename Scene",
+  "scene.duplicate": "Duplicate Scene",
+  "scene.delete": "Delete Scene",
+  "scene.set_startup": "Set as Startup Scene",
+  "scene.export": "Export Standalone Scene",
+  "scene.move_category": "Move to Current Category",
+  "scene.snapshot": "Save Current View Snapshot",
+  "scene.default_name": "New Scene",
+  "scene.rename_title": "Slide2D Scene Manager - Rename Scene",
+  "scene.cannot_delete_last": "A project must keep at least one scene",
+  "scene.name_exists": "A scene with this name already exists",
+  "scene.double_click": "Double-click a scene to switch the canvas"
 }

@@ -18,6 +18,18 @@ pub struct Scene {
     /// 场景名称，用于工程菜单和蓝图场景切换。
     #[serde(default = "default_scene_name")]
     pub name: String,
+    /// 场景稳定ID，用于独立场景文件名，重命名时不会改变。
+    #[serde(default)]
+    pub scene_id: String,
+    /// 场景大纲中的自定义分类名称。
+    #[serde(default = "default_scene_category")]
+    pub category: String,
+    /// 上次离开该场景时的编辑器视角。
+    #[serde(default = "SceneCameraState::new")]
+    pub editor_camera: SceneCameraState,
+    /// 当前场景专属的多个视角快照。
+    #[serde(default)]
+    pub camera_snapshots: Vec<CameraBookmark>,
     pub game_objects: Vec<GameObject>,
     #[serde(default = "TileMap::new")]
     pub tile_map: TileMap,
@@ -61,6 +73,24 @@ pub struct GameObject {
     /// 当前物体拥有的运行时数值变量，例如生命值、分数和速度。
     #[serde(default)]
     pub variables: HashMap<String, f32>,
+    /// 全局永久Actor在Runtime切换关卡时不会销毁。
+    #[serde(default)]
+    pub persistent: bool,
+}
+
+/// 场景保存的编辑器相机状态。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SceneCameraState {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub zoom: f32,
+}
+
+impl SceneCameraState {
+    /// 创建默认场景视角。
+    pub fn new() -> Self {
+        Self { offset_x: 0.0, offset_y: 0.0, zoom: 1.0 }
+    }
 }
 
 /// 表示当前正在拖动哪一种缩放控制点。
@@ -318,6 +348,8 @@ pub struct AppState {
     pub active_scene_index: usize,
     /// Runtime启动时首先加载的场景名称。
     pub startup_scene_name: String,
+    /// Scene Manager中持久化的分类文件夹，即使为空也会保留。
+    pub scene_categories: Vec<String>,
     /// 所有场景蓝图共同读写的全局数值变量。
     pub global_variables: HashMap<String, f32>,
     /// 当前打开或保存的.slide2d工程路径。
@@ -361,6 +393,12 @@ pub struct AppState {
     /// 截图合成器记录的最近画布像素尺寸。
     pub last_canvas_width: u32,
     pub last_canvas_height: u32,
+    /// 场景大纲新分类输入文字。
+    pub scene_category_name: String,
+    /// 场景重命名目标下标。
+    pub scene_rename_target: Option<usize>,
+    /// 场景重命名输入文字。
+    pub scene_rename_text: String,
 }
 
 impl AppState {
@@ -410,6 +448,7 @@ impl AppState {
             project_scenes: vec![Scene::empty("场景1")],
             active_scene_index: 0,
             startup_scene_name: "场景1".to_owned(),
+            scene_categories: vec!["Main Menu".to_owned(), "Levels".to_owned(), "Ending".to_owned()],
             global_variables: HashMap::new(),
             project_file_path: None,
             project_root,
@@ -432,6 +471,9 @@ impl AppState {
             assistant_texture_max_size: 2048,
             last_canvas_width: 1280,
             last_canvas_height: 720,
+            scene_category_name: String::new(),
+            scene_rename_target: None,
+            scene_rename_text: String::new(),
         }
     }
 
@@ -503,6 +545,7 @@ impl AppState {
             blueprint: Blueprint::new(),
             blueprint_file: format!("blueprint_{}.json", self.next_object_id),
             variables: HashMap::new(),
+            persistent: false,
         };
         self.selected_object_id = Some(game_object.id);
         self.selected_object_ids = vec![game_object.id];
@@ -529,6 +572,7 @@ impl AppState {
             blueprint: Blueprint::new(),
             blueprint_file: format!("blueprint_{}.json", self.next_object_id),
             variables: HashMap::new(),
+            persistent: false,
         };
         self.selected_object_id = Some(game_object.id);
         self.selected_object_ids = vec![game_object.id];
@@ -556,6 +600,7 @@ impl AppState {
             blueprint: Blueprint::new(),
             blueprint_file: format!("blueprint_{}.json", self.next_object_id),
             variables: HashMap::new(),
+            persistent: false,
         };
 
         self.selected_object_id = Some(game_object.id);
@@ -571,6 +616,17 @@ impl AppState {
         Scene {
             slide2d_engine: scene_format(),
             name: self.active_scene_name().to_owned(),
+            scene_id: self.project_scenes.get(self.active_scene_index)
+                .map(|scene| scene.scene_id.clone()).unwrap_or_else(|| self.next_scene_id()),
+            category: self.project_scenes.get(self.active_scene_index)
+                .map(|scene| scene.category.clone()).unwrap_or_else(default_scene_category),
+            editor_camera: SceneCameraState {
+                offset_x: self.view_offset_x,
+                offset_y: self.view_offset_y,
+                zoom: self.view_zoom,
+            },
+            camera_snapshots: self.project_scenes.get(self.active_scene_index)
+                .map(|scene| scene.camera_snapshots.clone()).unwrap_or_default(),
             game_objects: self.game_objects.clone(),
             tile_map: self.tile_map.clone(),
             ui_elements: self.ui_elements.clone(),
@@ -641,9 +697,11 @@ impl AppState {
         }
         self.store_active_scene();
         let scene = self.project_scenes[scene_index].clone();
+        let target_camera = scene.editor_camera.clone();
         let project_data = (
             self.project_scenes.clone(),
             self.startup_scene_name.clone(),
+            self.scene_categories.clone(),
             self.global_variables.clone(),
             self.project_file_path.clone(),
             self.project_root.clone(),
@@ -657,15 +715,19 @@ impl AppState {
         restored.project_scenes = project_data.0;
         restored.active_scene_index = scene_index;
         restored.startup_scene_name = project_data.1;
-        restored.global_variables = project_data.2;
-        restored.project_file_path = project_data.3;
-        restored.project_root = project_data.4;
-        restored.recent_projects = project_data.5;
-        restored.saved_project_snapshot = project_data.6;
-        restored.plugin_registry = project_data.7;
-        restored.performance_settings = project_data.8;
-        restored.assistant_settings = project_data.9;
+        restored.scene_categories = project_data.2;
+        restored.global_variables = project_data.3;
+        restored.project_file_path = project_data.4;
+        restored.project_root = project_data.5;
+        restored.recent_projects = project_data.6;
+        restored.saved_project_snapshot = project_data.7;
+        restored.plugin_registry = project_data.8;
+        restored.performance_settings = project_data.9;
+        restored.assistant_settings = project_data.10;
         restored.grid_size = restored.assistant_settings.grid_size;
+        restored.view_offset_x = target_camera.offset_x;
+        restored.view_offset_y = target_camera.offset_y;
+        restored.view_zoom = target_camera.zoom;
         restored.status_message = format!("已切换场景：{}", restored.active_scene_name());
         *self = restored;
     }
@@ -679,6 +741,10 @@ impl AppState {
             name.trim().to_owned()
         };
         self.project_scenes.push(Scene::empty(&final_name));
+        let scene_count = self.project_scenes.len();
+        if let Some(scene) = self.project_scenes.last_mut() {
+            scene.scene_id = format!("scene_{scene_count:06}");
+        }
         let index = self.project_scenes.len() - 1;
         self.switch_scene(index);
     }
@@ -696,6 +762,7 @@ impl AppState {
         serde_json::to_string(&(
             scenes,
             &self.startup_scene_name,
+            &self.scene_categories,
             &self.global_variables,
             enabled_plugins,
             &self.performance_settings,
@@ -724,6 +791,16 @@ impl AppState {
         self.blueprint_object_id = None;
         self.blueprint_tab_active = false;
     }
+
+    /// 生成当前工程中未使用的稳定场景ID。
+    pub fn next_scene_id(&self) -> String {
+        let mut number = 1_u64;
+        loop {
+            let id = format!("scene_{number:06}");
+            if !self.project_scenes.iter().any(|scene| scene.scene_id == id) { return id; }
+            number += 1;
+        }
+    }
 }
 
 impl Scene {
@@ -732,6 +809,10 @@ impl Scene {
         Self {
             slide2d_engine: scene_format(),
             name: name.to_owned(),
+            scene_id: String::new(),
+            category: default_scene_category(),
+            editor_camera: SceneCameraState::new(),
+            camera_snapshots: Vec::new(),
             game_objects: Vec::new(),
             tile_map: TileMap::new(),
             ui_elements: Vec::new(),
@@ -742,6 +823,11 @@ impl Scene {
 /// 旧场景文件缺少名称时提供稳定名称。
 fn default_scene_name() -> String {
     "场景1".to_owned()
+}
+
+/// 旧场景缺少分类时放入默认关卡组。
+fn default_scene_category() -> String {
+    "Levels".to_owned()
 }
 
 /// 返回场景文件固定的Slide2D格式标识。
@@ -780,5 +866,37 @@ mod project_state_tests {
         let restored: PerformanceSettings = serde_json::from_str(&json).expect("性能设置应可读取");
         assert!(!restored.viewport_culling);
         assert_eq!(restored.activity_margin, 512.0);
+    }
+
+    /// 验证Assistant Toolkit设置和摄像机书签可以跟随工程保存。
+    #[test]
+    fn assistant_settings_json_round_trip() {
+        let mut settings = AssistantSettings::new();
+        settings.snap_to_grid = true;
+        settings.grid_size = 32.0;
+        settings.camera_bookmarks.push(CameraBookmark {
+            name: "Camera 1".to_owned(),
+            offset_x: 100.0,
+            offset_y: 200.0,
+            zoom: 1.5,
+        });
+        let json = serde_json::to_string(&settings).expect("辅助设置应可保存");
+        let restored: AssistantSettings = serde_json::from_str(&json).expect("辅助设置应可读取");
+        assert!(restored.snap_to_grid);
+        assert_eq!(restored.grid_size, 32.0);
+        assert_eq!(restored.camera_bookmarks.len(), 1);
+    }
+
+    /// 验证清空场景会同时清理对象选择和蓝图目标。
+    #[test]
+    fn clear_scene_objects_resets_related_state() {
+        let mut state = AppState::new();
+        state.add_test_object();
+        state.selected_object_ids = vec![1];
+        state.blueprint_object_id = Some(1);
+        state.clear_scene_objects();
+        assert!(state.game_objects.is_empty());
+        assert!(state.selected_object_ids.is_empty());
+        assert_eq!(state.blueprint_object_id, None);
     }
 }

@@ -34,6 +34,9 @@ pub struct UiElement {
     /// UI元素自己的蓝图，按钮等组件可直接双击编辑逻辑。
     #[serde(default)]
     pub blueprint: Blueprint,
+    /// 全局永久UI在Runtime切换关卡时不会销毁。
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 /// 当前支持的四种游戏UI元素。
@@ -106,6 +109,7 @@ impl UiElement {
             visible: true,
             kind,
             blueprint: Blueprint::new(),
+            persistent: false,
         }
     }
 }
