@@ -505,6 +505,7 @@ impl AppState {
             variables: HashMap::new(),
         };
         self.selected_object_id = Some(game_object.id);
+        self.selected_object_ids = vec![game_object.id];
         self.selected_ui_id = None;
         self.game_objects.push(game_object);
         self.next_object_id += 1;
@@ -530,6 +531,7 @@ impl AppState {
             variables: HashMap::new(),
         };
         self.selected_object_id = Some(game_object.id);
+        self.selected_object_ids = vec![game_object.id];
         self.selected_ui_id = None;
         self.game_objects.push(game_object);
         self.next_object_id += 1;
@@ -557,6 +559,7 @@ impl AppState {
         };
 
         self.selected_object_id = Some(game_object.id);
+        self.selected_object_ids = vec![game_object.id];
         self.selected_ui_id = None;
         self.game_objects.push(game_object);
         self.next_object_id += 1;

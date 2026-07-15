@@ -1121,30 +1121,59 @@ fn draw_assistant_toolkit(
     app_state: &mut AppState,
     asset_library: &mut AssetLibrary,
 ) {
-    if !app_state.assistant_toolkit_open { return; }
+    if !app_state.assistant_toolkit_open {
+        return;
+    }
     let mut open = true;
     egui::Window::new(tr("window.assistant"))
         .open(&mut open)
         .default_size(Vec2::new(640.0, 720.0))
         .show(context, |ui| {
             ui.heading(tr("assistant.grid_ruler"));
-            if ui.add(egui::Slider::new(&mut app_state.assistant_settings.grid_size, 4.0..=256.0).text(tr("assistant.grid_size"))).changed() {
+            if ui
+                .add(
+                    egui::Slider::new(&mut app_state.assistant_settings.grid_size, 4.0..=256.0)
+                        .text(tr("assistant.grid_size")),
+                )
+                .changed()
+            {
                 app_state.grid_size = app_state.assistant_settings.grid_size;
             }
-            ui.checkbox(&mut app_state.assistant_settings.snap_to_grid, tr("assistant.snap"));
-            ui.checkbox(&mut app_state.assistant_settings.show_rulers, tr("assistant.rulers"));
+            ui.checkbox(
+                &mut app_state.assistant_settings.snap_to_grid,
+                tr("assistant.snap"),
+            );
+            ui.checkbox(
+                &mut app_state.assistant_settings.show_rulers,
+                tr("assistant.rulers"),
+            );
             ui.separator();
 
             ui.heading(tr("assistant.selection"));
             ui.label(tr("assistant.selection_help"));
-            ui.label(tr_args("assistant.selected_count", &[("value", app_state.selected_object_ids.len().to_string())]));
+            ui.label(tr_args(
+                "assistant.selected_count",
+                &[("value", app_state.selected_object_ids.len().to_string())],
+            ));
             ui.horizontal_wrapped(|ui| {
-                if ui.button(tr("assistant.align_left")).clicked() { align_selected_objects(app_state, AlignOperation::Left); }
-                if ui.button(tr("assistant.align_center")).clicked() { align_selected_objects(app_state, AlignOperation::Center); }
-                if ui.button(tr("assistant.align_top")).clicked() { align_selected_objects(app_state, AlignOperation::Top); }
-                if ui.button(tr("assistant.distribute")).clicked() { distribute_selected_objects(app_state); }
-                if ui.button(tr("assistant.duplicate_group")).clicked() { duplicate_selected_objects(app_state); }
-                if ui.button(tr("assistant.center_canvas")).clicked() { center_selected_objects_in_canvas(app_state); }
+                if ui.button(tr("assistant.align_left")).clicked() {
+                    align_selected_objects(app_state, AlignOperation::Left);
+                }
+                if ui.button(tr("assistant.align_center")).clicked() {
+                    align_selected_objects(app_state, AlignOperation::Center);
+                }
+                if ui.button(tr("assistant.align_top")).clicked() {
+                    align_selected_objects(app_state, AlignOperation::Top);
+                }
+                if ui.button(tr("assistant.distribute")).clicked() {
+                    distribute_selected_objects(app_state);
+                }
+                if ui.button(tr("assistant.duplicate_group")).clicked() {
+                    duplicate_selected_objects(app_state);
+                }
+                if ui.button(tr("assistant.center_canvas")).clicked() {
+                    center_selected_objects_in_canvas(app_state);
+                }
                 if ui.button(tr("assistant.clear_scene")).clicked() {
                     app_state.clear_scene_objects();
                     app_state.status_message = tr("assistant.cleared");
@@ -1153,33 +1182,69 @@ fn draw_assistant_toolkit(
             ui.separator();
 
             ui.heading(tr("assistant.colliders"));
-            ui.checkbox(&mut app_state.assistant_settings.show_object_colliders, tr("assistant.object_colliders"));
-            ui.checkbox(&mut app_state.assistant_settings.show_tile_colliders, tr("assistant.tile_colliders"));
-            ui.checkbox(&mut app_state.assistant_settings.show_static_colliders, tr("assistant.static_colliders"));
-            ui.checkbox(&mut app_state.assistant_settings.show_dynamic_colliders, tr("assistant.dynamic_colliders"));
+            ui.checkbox(
+                &mut app_state.assistant_settings.show_object_colliders,
+                tr("assistant.object_colliders"),
+            );
+            ui.checkbox(
+                &mut app_state.assistant_settings.show_tile_colliders,
+                tr("assistant.tile_colliders"),
+            );
+            ui.checkbox(
+                &mut app_state.assistant_settings.show_static_colliders,
+                tr("assistant.static_colliders"),
+            );
+            ui.checkbox(
+                &mut app_state.assistant_settings.show_dynamic_colliders,
+                tr("assistant.dynamic_colliders"),
+            );
             ui.separator();
 
             ui.heading(tr("assistant.assets"));
-            if ui.button(tr("assistant.select_assets")).clicked() {
-                app_state.assistant_selected_assets = collect_batch_assets(asset_library);
-            }
-            ui.label(tr_args("assistant.asset_count", &[("value", app_state.assistant_selected_assets.len().to_string())]));
+            ui.label(tr("assistant.select_assets"));
+            let candidates = collect_batch_assets(asset_library);
+            egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                for path in candidates {
+                    let mut selected = app_state.assistant_selected_assets.contains(&path);
+                    let label = path.strip_prefix(&app_state.project_root)
+                        .unwrap_or(&path).display().to_string();
+                    if ui.checkbox(&mut selected, label).changed() {
+                        if selected { app_state.assistant_selected_assets.push(path); }
+                        else { app_state.assistant_selected_assets.retain(|selected_path| selected_path != &path); }
+                    }
+                }
+            });
+            ui.label(tr_args(
+                "assistant.asset_count",
+                &[(
+                    "value",
+                    app_state.assistant_selected_assets.len().to_string(),
+                )],
+            ));
             ui.label(tr("assistant.batch_name"));
             ui.text_edit_singleline(&mut app_state.assistant_batch_name);
             if ui.button(tr("assistant.batch_rename")).clicked() {
-                app_state.status_message = batch_rename_assets(app_state, asset_library).unwrap_or_else(|error| error);
+                app_state.status_message =
+                    batch_rename_assets(app_state, asset_library).unwrap_or_else(|error| error);
             }
-            ui.add(egui::Slider::new(&mut app_state.assistant_texture_max_size, 128..=4096).text(tr("assistant.texture_size")));
+            ui.add(
+                egui::Slider::new(&mut app_state.assistant_texture_max_size, 128..=4096)
+                    .text(tr("assistant.texture_size")),
+            );
             if ui.button(tr("assistant.compress")).clicked() {
-                app_state.status_message = batch_resize_textures(app_state).unwrap_or_else(|error| error);
+                app_state.status_message =
+                    batch_resize_textures(app_state).unwrap_or_else(|error| error);
             }
             if ui.button(tr("assistant.export_frames")).clicked() {
-                app_state.status_message = export_selected_animation_frames(app_state).unwrap_or_else(|error| error);
+                app_state.status_message =
+                    export_selected_animation_frames(app_state).unwrap_or_else(|error| error);
             }
             ui.separator();
 
             ui.heading(tr("assistant.bookmarks"));
-            if ui.button(tr("assistant.save_bookmark")).clicked() { save_camera_bookmark(app_state); }
+            if ui.button(tr("assistant.save_bookmark")).clicked() {
+                save_camera_bookmark(app_state);
+            }
             let bookmarks = app_state.assistant_settings.camera_bookmarks.clone();
             for (index, bookmark) in bookmarks.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -1196,9 +1261,13 @@ fn draw_assistant_toolkit(
             ui.separator();
 
             ui.heading(tr("assistant.screenshot"));
-            ui.checkbox(&mut app_state.assistant_settings.transparent_screenshot, tr("assistant.transparent"));
+            ui.checkbox(
+                &mut app_state.assistant_settings.transparent_screenshot,
+                tr("assistant.transparent"),
+            );
             if ui.button(tr("assistant.capture")).clicked() {
-                app_state.status_message = export_canvas_screenshot(app_state).unwrap_or_else(|error| error);
+                app_state.status_message =
+                    export_canvas_screenshot(app_state).unwrap_or_else(|error| error);
             }
             ui.separator();
             ui.small("Slide2D Assistant Toolkit");
@@ -1209,19 +1278,45 @@ fn draw_assistant_toolkit(
 
 /// 对齐命令类型。
 #[derive(Clone, Copy)]
-enum AlignOperation { Left, Center, Top }
+enum AlignOperation {
+    Left,
+    Center,
+    Top,
+}
 
 /// 将多选对象按左边、中心或顶部统一对齐。
 fn align_selected_objects(app_state: &mut AppState, operation: AlignOperation) {
-    let selected: Vec<&GameObject> = app_state.game_objects.iter()
-        .filter(|object| app_state.selected_object_ids.contains(&object.id)).collect();
-    if selected.len() < 2 { app_state.status_message = tr("assistant.no_selection"); return; }
+    let selected: Vec<&GameObject> = app_state
+        .game_objects
+        .iter()
+        .filter(|object| app_state.selected_object_ids.contains(&object.id))
+        .collect();
+    if selected.len() < 2 {
+        app_state.status_message = tr("assistant.no_selection");
+        return;
+    }
     let target = match operation {
-        AlignOperation::Left => selected.iter().map(|object| object.x).fold(f32::INFINITY, f32::min),
-        AlignOperation::Center => selected.iter().map(|object| object.x + object.width * 0.5).sum::<f32>() / selected.len() as f32,
-        AlignOperation::Top => selected.iter().map(|object| object.y).fold(f32::INFINITY, f32::min),
+        AlignOperation::Left => selected
+            .iter()
+            .map(|object| object.x)
+            .fold(f32::INFINITY, f32::min),
+        AlignOperation::Center => {
+            selected
+                .iter()
+                .map(|object| object.x + object.width * 0.5)
+                .sum::<f32>()
+                / selected.len() as f32
+        }
+        AlignOperation::Top => selected
+            .iter()
+            .map(|object| object.y)
+            .fold(f32::INFINITY, f32::min),
     };
-    for object in app_state.game_objects.iter_mut().filter(|object| app_state.selected_object_ids.contains(&object.id)) {
+    for object in app_state
+        .game_objects
+        .iter_mut()
+        .filter(|object| app_state.selected_object_ids.contains(&object.id))
+    {
         match operation {
             AlignOperation::Left => object.x = target,
             AlignOperation::Center => object.x = target - object.width * 0.5,
@@ -1234,16 +1329,43 @@ fn align_selected_objects(app_state: &mut AppState, operation: AlignOperation) {
 fn distribute_selected_objects(app_state: &mut AppState) {
     let mut ids: Vec<u64> = app_state.selected_object_ids.clone();
     ids.sort_by(|left, right| {
-        let left_x = app_state.game_objects.iter().find(|object| object.id == *left).map(|object| object.x + object.width * 0.5).unwrap_or(0.0);
-        let right_x = app_state.game_objects.iter().find(|object| object.id == *right).map(|object| object.x + object.width * 0.5).unwrap_or(0.0);
+        let left_x = app_state
+            .game_objects
+            .iter()
+            .find(|object| object.id == *left)
+            .map(|object| object.x + object.width * 0.5)
+            .unwrap_or(0.0);
+        let right_x = app_state
+            .game_objects
+            .iter()
+            .find(|object| object.id == *right)
+            .map(|object| object.x + object.width * 0.5)
+            .unwrap_or(0.0);
         left_x.total_cmp(&right_x)
     });
-    if ids.len() < 3 { app_state.status_message = tr("assistant.no_selection"); return; }
-    let first = app_state.game_objects.iter().find(|object| object.id == ids[0]).map(|object| object.x + object.width * 0.5).unwrap_or(0.0);
-    let last = app_state.game_objects.iter().find(|object| object.id == *ids.last().unwrap()).map(|object| object.x + object.width * 0.5).unwrap_or(first);
+    if ids.len() < 3 {
+        app_state.status_message = tr("assistant.no_selection");
+        return;
+    }
+    let first = app_state
+        .game_objects
+        .iter()
+        .find(|object| object.id == ids[0])
+        .map(|object| object.x + object.width * 0.5)
+        .unwrap_or(0.0);
+    let last = app_state
+        .game_objects
+        .iter()
+        .find(|object| object.id == *ids.last().unwrap())
+        .map(|object| object.x + object.width * 0.5)
+        .unwrap_or(first);
     let spacing = (last - first) / (ids.len() - 1) as f32;
     for (index, id) in ids.iter().enumerate().skip(1).take(ids.len() - 2) {
-        if let Some(object) = app_state.game_objects.iter_mut().find(|object| object.id == *id) {
+        if let Some(object) = app_state
+            .game_objects
+            .iter_mut()
+            .find(|object| object.id == *id)
+        {
             object.x = first + spacing * index as f32 - object.width * 0.5;
         }
     }
@@ -1251,8 +1373,12 @@ fn distribute_selected_objects(app_state: &mut AppState) {
 
 /// 复制全部选中对象，分配新ID、蓝图文件名和轻微偏移。
 fn duplicate_selected_objects(app_state: &mut AppState) {
-    let sources: Vec<GameObject> = app_state.game_objects.iter()
-        .filter(|object| app_state.selected_object_ids.contains(&object.id)).cloned().collect();
+    let sources: Vec<GameObject> = app_state
+        .game_objects
+        .iter()
+        .filter(|object| app_state.selected_object_ids.contains(&object.id))
+        .cloned()
+        .collect();
     let mut new_ids = Vec::new();
     for mut object in sources {
         object.id = app_state.next_object_id;
@@ -1271,26 +1397,48 @@ fn duplicate_selected_objects(app_state: &mut AppState) {
 
 /// 调整场景相机，使所选对象包围盒中心落在最近画布中心。
 fn center_selected_objects_in_canvas(app_state: &mut AppState) {
-    let selected: Vec<&GameObject> = app_state.game_objects.iter()
-        .filter(|object| app_state.selected_object_ids.contains(&object.id)).collect();
-    if selected.is_empty() { return; }
-    let left = selected.iter().map(|object| object.x).fold(f32::INFINITY, f32::min);
-    let right = selected.iter().map(|object| object.x + object.width).fold(f32::NEG_INFINITY, f32::max);
-    let top = selected.iter().map(|object| object.y).fold(f32::INFINITY, f32::min);
-    let bottom = selected.iter().map(|object| object.y + object.height).fold(f32::NEG_INFINITY, f32::max);
-    app_state.view_offset_x = app_state.last_canvas_width as f32 * 0.5 - (left + right) * 0.5 * app_state.view_zoom;
-    app_state.view_offset_y = app_state.last_canvas_height as f32 * 0.5 - (top + bottom) * 0.5 * app_state.view_zoom;
+    let selected: Vec<&GameObject> = app_state
+        .game_objects
+        .iter()
+        .filter(|object| app_state.selected_object_ids.contains(&object.id))
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    let left = selected
+        .iter()
+        .map(|object| object.x)
+        .fold(f32::INFINITY, f32::min);
+    let right = selected
+        .iter()
+        .map(|object| object.x + object.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let top = selected
+        .iter()
+        .map(|object| object.y)
+        .fold(f32::INFINITY, f32::min);
+    let bottom = selected
+        .iter()
+        .map(|object| object.y + object.height)
+        .fold(f32::NEG_INFINITY, f32::max);
+    app_state.view_offset_x =
+        app_state.last_canvas_width as f32 * 0.5 - (left + right) * 0.5 * app_state.view_zoom;
+    app_state.view_offset_y =
+        app_state.last_canvas_height as f32 * 0.5 - (top + bottom) * 0.5 * app_state.view_zoom;
 }
 
 /// 保存当前画布平移和缩放为工程级摄像机书签。
 fn save_camera_bookmark(app_state: &mut AppState) {
     let index = app_state.assistant_settings.camera_bookmarks.len() + 1;
-    app_state.assistant_settings.camera_bookmarks.push(crate::app_state::CameraBookmark {
-        name: format!("Camera {index}"),
-        offset_x: app_state.view_offset_x,
-        offset_y: app_state.view_offset_y,
-        zoom: app_state.view_zoom,
-    });
+    app_state
+        .assistant_settings
+        .camera_bookmarks
+        .push(crate::app_state::CameraBookmark {
+            name: format!("Camera {index}"),
+            offset_x: app_state.view_offset_x,
+            offset_y: app_state.view_offset_y,
+            zoom: app_state.view_zoom,
+        });
 }
 
 /// 收集资源库中全部PNG和动画文件，供批处理窗口选择。
@@ -1314,21 +1462,34 @@ fn collect_asset_entry_paths(entries: &[AssetEntry], paths: &mut Vec<std::path::
 }
 
 /// 将所选素材按路径排序后使用基础名称和三位序号重命名。
-fn batch_rename_assets(app_state: &mut AppState, asset_library: &mut AssetLibrary) -> Result<String, String> {
+fn batch_rename_assets(
+    app_state: &mut AppState,
+    asset_library: &mut AssetLibrary,
+) -> Result<String, String> {
     let base = app_state.assistant_batch_name.trim();
-    if base.is_empty() { return Err("Slide2D Assistant Toolkit: empty batch name".to_owned()); }
+    if base.is_empty() {
+        return Err("Slide2D Assistant Toolkit: empty batch name".to_owned());
+    }
     let mut selected = app_state.assistant_selected_assets.clone();
     selected.sort();
     let mut renamed = Vec::new();
     for (index, path) in selected.iter().enumerate() {
-        if !path.is_file() { continue; }
-        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+        if !path.is_file() {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
         let new_name = format!("{}_{:03}.{}", base, index + 1, extension);
         renamed.push(crate::assets::rename_resource(path, &new_name)?);
     }
     app_state.assistant_selected_assets = renamed;
     asset_library.refresh();
-    Ok(format!("Slide2D Assistant Toolkit: renamed {} assets", app_state.assistant_selected_assets.len()))
+    Ok(format!(
+        "Slide2D Assistant Toolkit: renamed {} assets",
+        app_state.assistant_selected_assets.len()
+    ))
 }
 
 /// 批量缩小所选PNG并使用PNG编码保存，透明通道保持不变。
@@ -1336,35 +1497,63 @@ fn batch_resize_textures(app_state: &AppState) -> Result<String, String> {
     use image::GenericImageView;
     let mut count = 0;
     for path in &app_state.assistant_selected_assets {
-        if path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("png")) != Some(true) { continue; }
-        let image = image::open(path).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("png"))
+            != Some(true)
+        {
+            continue;
+        }
+        let image =
+            image::open(path).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
         let (width, height) = image.dimensions();
         let maximum = app_state.assistant_texture_max_size.max(1);
         let output = if width > maximum || height > maximum {
             let scale = maximum as f32 / width.max(height) as f32;
-            image.resize((width as f32 * scale) as u32, (height as f32 * scale) as u32, image::imageops::FilterType::Lanczos3)
-        } else { image };
-        output.save_with_format(path, image::ImageFormat::Png).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+            image.resize(
+                (width as f32 * scale) as u32,
+                (height as f32 * scale) as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            image
+        };
+        output
+            .save_with_format(path, image::ImageFormat::Png)
+            .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
         count += 1;
     }
-    Ok(format!("Slide2D Assistant Toolkit: processed {count} textures"))
+    Ok(format!(
+        "Slide2D Assistant Toolkit: processed {count} textures"
+    ))
 }
 
 /// 将所选.s2anim全部序列帧复制到工程AssistantExports目录并生成标识清单。
 fn export_selected_animation_frames(app_state: &AppState) -> Result<String, String> {
-    let root = app_state.project_root.join("AssistantExports/AnimationFrames");
+    let root = app_state
+        .project_root
+        .join("AssistantExports/AnimationFrames");
     fs::create_dir_all(&root).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
     let mut exported = 0;
     for path in &app_state.assistant_selected_assets {
-        if path.extension().and_then(|value| value.to_str()) != Some("s2anim") { continue; }
+        if path.extension().and_then(|value| value.to_str()) != Some("s2anim") {
+            continue;
+        }
         let animation = crate::animation::SpriteAnimation::load(path)?;
-        let target = root.join(path.file_stem().and_then(|value| value.to_str()).unwrap_or("animation"));
-        fs::create_dir_all(&target).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+        let target = root.join(
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("animation"),
+        );
+        fs::create_dir_all(&target)
+            .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
         let mut files = Vec::new();
         for (index, frame) in animation.frames.iter().enumerate() {
             let source = resolve_asset_path(&app_state.project_root, frame);
             let output = target.join(format!("frame_{:04}.png", index + 1));
-            fs::copy(source, &output).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+            fs::copy(source, &output)
+                .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
             files.push(output.file_name().unwrap().to_string_lossy().into_owned());
             exported += 1;
         }
@@ -1375,15 +1564,19 @@ fn export_selected_animation_frames(app_state: &AppState) -> Result<String, Stri
             "looping": animation.looping,
             "frames": files
         });
-        fs::write(target.join("slide2d.frames.json"), serde_json::to_vec_pretty(&manifest).unwrap_or_default())
-            .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+        fs::write(
+            target.join("slide2d.frames.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+        )
+        .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
     }
-    Ok(format!("Slide2D Assistant Toolkit: exported {exported} frames"))
+    Ok(format!(
+        "Slide2D Assistant Toolkit: exported {exported} frames"
+    ))
 }
 
 /// 将当前画布视角合成为PNG并保存到工程Screenshots目录。
 fn export_canvas_screenshot(app_state: &AppState) -> Result<String, String> {
-    use image::GenericImageView;
     let width = app_state.last_canvas_width.max(1);
     let height = app_state.last_canvas_height.max(1);
     let background = if app_state.assistant_settings.transparent_screenshot {
@@ -1397,18 +1590,44 @@ fn export_canvas_screenshot(app_state: &AppState) -> Result<String, String> {
     if let Some(tileset) = &app_state.tile_map.tileset {
         let atlas_path = resolve_asset_path(&app_state.project_root, &tileset.image_path);
         if let Ok(atlas) = image::open(atlas_path) {
-            for layer in app_state.tile_map.layers.iter().filter(|layer| layer.visible) {
+            for layer in app_state
+                .tile_map
+                .layers
+                .iter()
+                .filter(|layer| layer.visible)
+            {
                 for cell in &layer.cells {
                     let columns = (atlas.width() / tileset.tile_width.max(1)).max(1);
                     let source_x = cell.tile_id % columns * tileset.tile_width;
                     let source_y = cell.tile_id / columns * tileset.tile_height;
-                    let frame = atlas.crop_imm(source_x, source_y, tileset.tile_width, tileset.tile_height);
-                    let screen_x = app_state.view_offset_x + cell.x as f32 * app_state.tile_map.tile_width as f32 * app_state.view_zoom;
-                    let screen_y = app_state.view_offset_y + cell.y as f32 * app_state.tile_map.tile_height as f32 * app_state.view_zoom;
-                    let output_width = (app_state.tile_map.tile_width as f32 * app_state.view_zoom).max(1.0) as u32;
-                    let output_height = (app_state.tile_map.tile_height as f32 * app_state.view_zoom).max(1.0) as u32;
-                    let frame = frame.resize_exact(output_width, output_height, image::imageops::FilterType::Nearest).to_rgba8();
-                    image::imageops::overlay(&mut canvas, &frame, screen_x.round() as i64, screen_y.round() as i64);
+                    let frame =
+                        atlas.crop_imm(source_x, source_y, tileset.tile_width, tileset.tile_height);
+                    let screen_x = app_state.view_offset_x
+                        + cell.x as f32
+                            * app_state.tile_map.tile_width as f32
+                            * app_state.view_zoom;
+                    let screen_y = app_state.view_offset_y
+                        + cell.y as f32
+                            * app_state.tile_map.tile_height as f32
+                            * app_state.view_zoom;
+                    let output_width = (app_state.tile_map.tile_width as f32 * app_state.view_zoom)
+                        .max(1.0) as u32;
+                    let output_height = (app_state.tile_map.tile_height as f32
+                        * app_state.view_zoom)
+                        .max(1.0) as u32;
+                    let frame = frame
+                        .resize_exact(
+                            output_width,
+                            output_height,
+                            image::imageops::FilterType::Nearest,
+                        )
+                        .to_rgba8();
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &frame,
+                        screen_x.round() as i64,
+                        screen_y.round() as i64,
+                    );
                 }
             }
         }
@@ -1424,21 +1643,49 @@ fn export_canvas_screenshot(app_state: &AppState) -> Result<String, String> {
         if !object.image_path.is_empty() {
             let path = resolve_asset_path(&app_state.project_root, &object.image_path);
             if let Ok(image) = image::open(path) {
-                let image = image.resize_exact(object_width, object_height, image::imageops::FilterType::Lanczos3).to_rgba8();
+                let image = image
+                    .resize_exact(
+                        object_width,
+                        object_height,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                    .to_rgba8();
                 image::imageops::overlay(&mut canvas, &image, x.round() as i64, y.round() as i64);
                 continue;
             }
         }
-        fill_rgba_rectangle(&mut canvas, x, y, object_width, object_height, image::Rgba([64, 140, 217, 255]));
+        fill_rgba_rectangle(
+            &mut canvas,
+            x,
+            y,
+            object_width,
+            object_height,
+            image::Rgba([64, 140, 217, 255]),
+        );
     }
 
-    for element in app_state.ui_elements.iter().filter(|element| element.visible) {
+    for element in app_state
+        .ui_elements
+        .iter()
+        .filter(|element| element.visible)
+    {
         let color = match &element.kind {
             UiElementKind::ImagePanel { image_path } if !image_path.is_empty() => {
                 let path = resolve_asset_path(&app_state.project_root, image_path);
                 if let Ok(image) = image::open(path) {
-                    let image = image.resize_exact(element.width.max(1.0) as u32, element.height.max(1.0) as u32, image::imageops::FilterType::Lanczos3).to_rgba8();
-                    image::imageops::overlay(&mut canvas, &image, element.x.round() as i64, element.y.round() as i64);
+                    let image = image
+                        .resize_exact(
+                            element.width.max(1.0) as u32,
+                            element.height.max(1.0) as u32,
+                            image::imageops::FilterType::Lanczos3,
+                        )
+                        .to_rgba8();
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &image,
+                        element.x.round() as i64,
+                        element.y.round() as i64,
+                    );
                     continue;
                 }
                 image::Rgba([90, 90, 100, 220])
@@ -1448,17 +1695,31 @@ fn export_canvas_screenshot(app_state: &AppState) -> Result<String, String> {
             UiElementKind::ProgressBar { fill_color, .. } => image::Rgba(*fill_color),
             UiElementKind::ImagePanel { .. } => image::Rgba([90, 90, 100, 220]),
         };
-        fill_rgba_rectangle(&mut canvas, element.x, element.y, element.width.max(1.0) as u32, element.height.max(1.0) as u32, color);
+        fill_rgba_rectangle(
+            &mut canvas,
+            element.x,
+            element.y,
+            element.width.max(1.0) as u32,
+            element.height.max(1.0) as u32,
+            color,
+        );
     }
 
     let directory = app_state.project_root.join("Screenshots");
-    fs::create_dir_all(&directory).map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs()).unwrap_or(0);
-    let path = directory.join(format!("Slide2D_Canvas_{timestamp}.png"));
-    canvas.save_with_format(&path, image::ImageFormat::Png)
+    fs::create_dir_all(&directory)
         .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
-    Ok(tr_args("assistant.screenshot_saved", &[("value", path.display().to_string())]))
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let path = directory.join(format!("Slide2D_Canvas_{timestamp}.png"));
+    canvas
+        .save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|error| format!("Slide2D Assistant Toolkit: {error}"))?;
+    Ok(tr_args(
+        "assistant.screenshot_saved",
+        &[("value", path.display().to_string())],
+    ))
 }
 
 /// 在截图像素缓冲区中填充一个裁剪后的矩形。
@@ -1475,7 +1736,9 @@ fn fill_rgba_rectangle(
     let end_x = start_x.saturating_add(width).min(image.width());
     let end_y = start_y.saturating_add(height).min(image.height());
     for pixel_y in start_y..end_y {
-        for pixel_x in start_x..end_x { image.put_pixel(pixel_x, pixel_y, color); }
+        for pixel_x in start_x..end_x {
+            image.put_pixel(pixel_x, pixel_y, color);
+        }
     }
 }
 
@@ -2922,11 +3185,16 @@ fn draw_settings_contents(ui: &mut egui::Ui, app_state: &mut AppState) {
         );
         ui.horizontal(|ui| {
             ui.label(tr("settings.grid_spacing"));
-            ui.add(
-                egui::DragValue::new(&mut app_state.grid_size)
-                    .speed(1.0)
-                    .range(8.0..=200.0),
-            );
+            if ui
+                .add(
+                    egui::DragValue::new(&mut app_state.grid_size)
+                        .speed(1.0)
+                        .range(8.0..=200.0),
+                )
+                .changed()
+            {
+                app_state.assistant_settings.grid_size = app_state.grid_size;
+            }
         });
         ui.horizontal(|ui| {
             ui.label(tr("settings.background"));
@@ -4419,11 +4687,7 @@ fn draw_tile_map(
             if app_state.assistant_settings.show_tile_colliders
                 && (layer.kind == TileLayerKind::Collision || property_collision)
             {
-                painter.rect_stroke(
-                    rect,
-                    0.0,
-                    Stroke::new(2.0, Color32::from_rgb(255, 70, 70)),
-                );
+                painter.rect_stroke(rect, 0.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 70, 70)));
             }
         }
     }
@@ -4740,29 +5004,78 @@ fn draw_canvas_rulers(
     canvas_rect: Rect,
     app_state: &AppState,
 ) {
-    if !app_state.assistant_settings.show_rulers { return; }
+    if !app_state.assistant_settings.show_rulers {
+        return;
+    }
     let ruler_size = 22.0;
     let background = Color32::from_rgba_unmultiplied(25, 30, 38, 220);
-    painter.rect_filled(Rect::from_min_max(canvas_rect.min, Pos2::new(canvas_rect.right(), canvas_rect.top() + ruler_size)), 0.0, background);
-    painter.rect_filled(Rect::from_min_max(canvas_rect.min, Pos2::new(canvas_rect.left() + ruler_size, canvas_rect.bottom())), 0.0, background);
+    painter.rect_filled(
+        Rect::from_min_max(
+            canvas_rect.min,
+            Pos2::new(canvas_rect.right(), canvas_rect.top() + ruler_size),
+        ),
+        0.0,
+        background,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            canvas_rect.min,
+            Pos2::new(canvas_rect.left() + ruler_size, canvas_rect.bottom()),
+        ),
+        0.0,
+        background,
+    );
     let step = (app_state.assistant_settings.grid_size.max(8.0) * app_state.view_zoom).max(24.0);
     let mut x = canvas_rect.left() + app_state.view_offset_x.rem_euclid(step);
     while x <= canvas_rect.right() {
         let scene = screen_to_scene(Pos2::new(x, canvas_rect.top()), canvas_rect, app_state);
-        painter.line_segment([Pos2::new(x, canvas_rect.top()), Pos2::new(x, canvas_rect.top() + 7.0)], Stroke::new(1.0, Color32::LIGHT_GRAY));
-        painter.text(Pos2::new(x + 2.0, canvas_rect.top() + 8.0), egui::Align2::LEFT_TOP, format!("{:.0}", scene.x), egui::FontId::monospace(9.0), Color32::LIGHT_GRAY);
+        painter.line_segment(
+            [
+                Pos2::new(x, canvas_rect.top()),
+                Pos2::new(x, canvas_rect.top() + 7.0),
+            ],
+            Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+        );
+        painter.text(
+            Pos2::new(x + 2.0, canvas_rect.top() + 8.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.0}", scene.x),
+            egui::FontId::monospace(9.0),
+            Color32::LIGHT_GRAY,
+        );
         x += step;
     }
     let mut y = canvas_rect.top() + app_state.view_offset_y.rem_euclid(step);
     while y <= canvas_rect.bottom() {
         let scene = screen_to_scene(Pos2::new(canvas_rect.left(), y), canvas_rect, app_state);
-        painter.line_segment([Pos2::new(canvas_rect.left(), y), Pos2::new(canvas_rect.left() + 7.0, y)], Stroke::new(1.0, Color32::LIGHT_GRAY));
-        painter.text(Pos2::new(canvas_rect.left() + 8.0, y + 2.0), egui::Align2::LEFT_TOP, format!("{:.0}", scene.y), egui::FontId::monospace(9.0), Color32::LIGHT_GRAY);
+        painter.line_segment(
+            [
+                Pos2::new(canvas_rect.left(), y),
+                Pos2::new(canvas_rect.left() + 7.0, y),
+            ],
+            Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+        );
+        painter.text(
+            Pos2::new(canvas_rect.left() + 8.0, y + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.0}", scene.y),
+            egui::FontId::monospace(9.0),
+            Color32::LIGHT_GRAY,
+        );
         y += step;
     }
-    if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()).filter(|position| canvas_rect.contains(*position)) {
+    if let Some(pointer) = ui
+        .input(|input| input.pointer.hover_pos())
+        .filter(|position| canvas_rect.contains(*position))
+    {
         let scene = screen_to_scene(pointer, canvas_rect, app_state);
-        painter.text(pointer + Vec2::new(12.0, 12.0), egui::Align2::LEFT_TOP, format!("X {:.1}  Y {:.1}", scene.x, scene.y), egui::FontId::monospace(11.0), Color32::WHITE);
+        painter.text(
+            pointer + Vec2::new(12.0, 12.0),
+            egui::Align2::LEFT_TOP,
+            format!("X {:.1}  Y {:.1}", scene.x, scene.y),
+            egui::FontId::monospace(11.0),
+            Color32::WHITE,
+        );
     }
 }
 
@@ -4893,22 +5206,50 @@ fn update_object_interaction(pointer_position: Pos2, app_state: &mut AppState) {
             }
         }
         Some(ResizeHandle::TopLeft) => {
-            let game_object = match app_state.game_objects.iter_mut().find(|object| object.id == object_id) { Some(object) => object, None => return };
+            let game_object = match app_state
+                .game_objects
+                .iter_mut()
+                .find(|object| object.id == object_id)
+            {
+                Some(object) => object,
+                None => return,
+            };
             resize_from_left(game_object, start_x, start_width, delta_x);
             resize_from_top(game_object, start_y, start_height, delta_y);
         }
         Some(ResizeHandle::TopRight) => {
-            let game_object = match app_state.game_objects.iter_mut().find(|object| object.id == object_id) { Some(object) => object, None => return };
+            let game_object = match app_state
+                .game_objects
+                .iter_mut()
+                .find(|object| object.id == object_id)
+            {
+                Some(object) => object,
+                None => return,
+            };
             resize_from_right(game_object, start_width, delta_x);
             resize_from_top(game_object, start_y, start_height, delta_y);
         }
         Some(ResizeHandle::BottomLeft) => {
-            let game_object = match app_state.game_objects.iter_mut().find(|object| object.id == object_id) { Some(object) => object, None => return };
+            let game_object = match app_state
+                .game_objects
+                .iter_mut()
+                .find(|object| object.id == object_id)
+            {
+                Some(object) => object,
+                None => return,
+            };
             resize_from_left(game_object, start_x, start_width, delta_x);
             resize_from_bottom(game_object, start_height, delta_y);
         }
         Some(ResizeHandle::BottomRight) => {
-            let game_object = match app_state.game_objects.iter_mut().find(|object| object.id == object_id) { Some(object) => object, None => return };
+            let game_object = match app_state
+                .game_objects
+                .iter_mut()
+                .find(|object| object.id == object_id)
+            {
+                Some(object) => object,
+                None => return,
+            };
             resize_from_right(game_object, start_width, delta_x);
             resize_from_bottom(game_object, start_height, delta_y);
         }
@@ -5056,7 +5397,7 @@ fn draw_game_objects(
                 } else {
                     Color32::from_rgb(255, 165, 40)
                 };
-                painter.rect_stroke(object_rect, 0.0, Stroke::new(3.0, color));
+                painter.rect_stroke(object_rect, 0.0, Stroke::new(3.0_f32, color));
             }
         }
         if app_state.selected_object_ids.contains(&game_object.id)
@@ -5065,7 +5406,7 @@ fn draw_game_objects(
             painter.rect_stroke(
                 object_rect,
                 0.0,
-                Stroke::new(2.0, Color32::from_rgb(60, 220, 255)),
+                Stroke::new(2.0_f32, Color32::from_rgb(60, 220, 255)),
             );
         }
     }
