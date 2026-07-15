@@ -1,0 +1,25 @@
+{
+  "game_objects": [],
+  "tile_map": {
+    "tileset_path": "assets/tilesets/屏幕截图 2026-07-10 222630.s2tileset",
+    "tile_width": 32,
+    "tile_height": 32,
+    "layers": [
+      {
+        "kind": "Ground",
+        "visible": true,
+        "cells": []
+      },
+      {
+        "kind": "Decoration",
+        "visible": true,
+        "cells": []
+      },
+      {
+        "kind": "Collision",
+        "visible": true,
+        "cells": []
+      }
+    ]
+  }
+}

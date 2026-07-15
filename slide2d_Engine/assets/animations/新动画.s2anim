@@ -1,0 +1,19 @@
+{
+  "name": "新动画",
+  "frames": [
+    "assets/images/animation_frames/Screenshot_2026-07-12T141943_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-10 222630_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-10 222618_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-10 222546_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-10 222540_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-10 201304_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-07-05 170916_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-05-31 010710_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-05-31 010704_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-05-31 010626_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-05-31 003655_1.png",
+    "assets/images/animation_frames/屏幕截图 2026-05-31 003537_1.png"
+  ],
+  "frames_per_second": 12.0,
+  "looping": true
+}

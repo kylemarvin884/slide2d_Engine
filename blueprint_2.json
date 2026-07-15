@@ -1,0 +1,28 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "x": 22.666664,
+      "y": 166.0,
+      "kind": "CollisionTriggered"
+    },
+    {
+      "id": 2,
+      "x": 386.66666,
+      "y": 284.33334,
+      "kind": {
+        "SetVariable": {
+          "name": "score",
+          "value": 0.0
+        }
+      }
+    }
+  ],
+  "connections": [
+    {
+      "from_node_id": 1,
+      "to_node_id": 2
+    }
+  ],
+  "next_node_id": 3
+}

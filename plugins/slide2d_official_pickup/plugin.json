@@ -1,0 +1,38 @@
+{
+  "slide2d_plugin_system": "SLIDE2D_PLUGIN_SYSTEM",
+  "plugin_id": "slide2d.official.pickup",
+  "name": "道具拾取系统",
+  "version": "1.0.0",
+  "author": "Slide2D Official",
+  "description": "提供拾取判定蓝图节点，演示无脚本插件扩展。",
+  "nodes": [
+    {
+      "node_type": "pickup_check",
+      "display_name": "拾取判定",
+      "description": "当前Actor被鼠标点击时走拾取成功端口，否则走未拾取端口。",
+      "category": "Logic",
+      "behavior": "PickupCheck",
+      "variable_name": "picked",
+      "value": 1.0
+    }
+  ],
+  "resources": [
+    {
+      "display_name": "拾取道具资源",
+      "folder": "plugins/slide2d_official_pickup/items",
+      "extensions": [
+        "s2item"
+      ]
+    }
+  ],
+  "editor_tools": [
+    {
+      "tool_id": "pickup_help",
+      "display_name": "拾取系统工具",
+      "description": "查看拾取节点使用说明和已注册能力。"
+    }
+  ],
+  "runtime_capabilities": [
+    "PickupCheck"
+  ]
+}

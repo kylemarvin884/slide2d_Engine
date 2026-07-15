@@ -1,0 +1,31 @@
+[package]
+name = "slide2d_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 窗口系统
+winit = "0.29"
+# 渲染底层GPU DX12/Vulkan
+wgpu = "0.20"
+# UI编辑器框架（egui）
+egui = "0.28"
+egui-wgpu = "0.28"
+egui-winit = "0.28"
+# 在程序启动时等待GPU初始化完成
+pollster = "0.3"
+# 将Rust顶点结构安全转换为GPU需要的字节数据
+bytemuck = { version = "1.25", features = ["derive"] }
+# 2D物理引擎
+rapier2d = { version = "0.18", features = ["f32"] }
+# 序列化，保存蓝图和场景为JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 图片加载
+image = { version = "0.25", features = ["png"] }
+# 矢量数学，坐标、向量
+nalgebra-glm = "0.18"
+# 文件对话框，打开资源图片
+rfd = "0.14"
+# Runtime播放场景中的音效对象
+rodio = "0.19"

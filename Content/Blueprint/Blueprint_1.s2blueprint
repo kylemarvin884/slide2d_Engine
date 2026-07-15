@@ -1,0 +1,112 @@
+{
+  "slide2d_engine": "SLIDE2D_BLUEPRINT",
+  "nodes": [
+    {
+      "id": 26,
+      "x": 50.0,
+      "y": 80.0,
+      "kind": {
+        "KeyPressed": {
+          "key": "KeyW"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "x": 50.0,
+      "y": 185.0,
+      "kind": {
+        "KeyPressed": {
+          "key": "KeyA"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "x": 50.0,
+      "y": 290.0,
+      "kind": {
+        "KeyPressed": {
+          "key": "KeyS"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "x": 50.0,
+      "y": 395.0,
+      "kind": {
+        "KeyPressed": {
+          "key": "KeyD"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "x": 644.80505,
+      "y": -60.7896,
+      "kind": {
+        "ModifyPosition": {
+          "delta_x": 0.0,
+          "delta_y": -200.0
+        }
+      }
+    },
+    {
+      "id": 31,
+      "x": 722.8309,
+      "y": 111.30613,
+      "kind": {
+        "ModifyPosition": {
+          "delta_x": 200.0,
+          "delta_y": 0.0
+        }
+      }
+    },
+    {
+      "id": 32,
+      "x": 720.16125,
+      "y": 299.4157,
+      "kind": {
+        "ModifyPosition": {
+          "delta_x": 0.0,
+          "delta_y": 200.0
+        }
+      }
+    },
+    {
+      "id": 33,
+      "x": 504.93857,
+      "y": 500.77408,
+      "kind": {
+        "ModifyPosition": {
+          "delta_x": -200.0,
+          "delta_y": 0.0
+        }
+      }
+    }
+  ],
+  "connections": [
+    {
+      "from_node_id": 26,
+      "to_node_id": 30,
+      "from_port": 0
+    },
+    {
+      "from_node_id": 27,
+      "to_node_id": 31,
+      "from_port": 0
+    },
+    {
+      "from_node_id": 28,
+      "to_node_id": 32,
+      "from_port": 0
+    },
+    {
+      "from_node_id": 29,
+      "to_node_id": 33,
+      "from_port": 0
+    }
+  ],
+  "next_node_id": 34
+}
