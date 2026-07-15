@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process::Command};
 
@@ -186,8 +187,7 @@ pub fn run(mut app_state: AppState) -> Result<(), String> {
     );
     let mut egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
     let mut editor_textures = EditorTextures::new();
-    let project_root = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut asset_library = AssetLibrary::new(project_root)?;
+    let mut asset_library = AssetLibrary::new(app_state.project_root.clone())?;
     let mut applied_language_revision = language_revision();
     app_state.mark_project_saved();
     let mut last_cursor_position = Pos2::ZERO;
@@ -1492,9 +1492,9 @@ fn batch_rename_assets(
             .and_then(|value| value.to_str())
             .unwrap_or("");
         let new_name = format!("{}_{:03}.{}", base, index + 1, extension);
-        let old_relative = project_relative_asset_path(path);
+        let old_relative = project_relative_asset_path(&app_state.project_root, path);
         let output = crate::assets::rename_resource(path, &new_name)?;
-        let new_relative = project_relative_asset_path(&output);
+        let new_relative = project_relative_asset_path(&app_state.project_root, &output);
         replace_asset_references(app_state, &old_relative, &new_relative);
         renamed.push(output);
     }
@@ -2197,8 +2197,6 @@ fn save_project_as(
     save_project_folder(app_state, &path)?;
     app_state.plugin_registry =
         crate::plugins::PluginRegistry::load(path.clone(), &enabled_plugins);
-    std::env::set_current_dir(&path)
-        .map_err(|error| format!("切换到另存为工程目录失败：{error}"))?;
     *asset_library = AssetLibrary::new(path)?;
     Ok(())
 }
@@ -2231,7 +2229,6 @@ fn open_project_from_folder(
 ) {
     match open_project_folder(path) {
         Ok(mut state) => {
-            let _ = std::env::set_current_dir(&state.project_root);
             match AssetLibrary::new(state.project_root.clone()) {
                 Ok(library) => {
                     state.status_message = format!("Slide2D工程已打开：{}", path.display());
@@ -2340,8 +2337,6 @@ fn create_new_project(
 
     let new_asset_library = AssetLibrary::new(project_root.clone())?;
     save_project_folder(&mut new_state, &project_root)?;
-    std::env::set_current_dir(&project_root)
-        .map_err(|error| format!("切换到新工程目录失败：{error}"))?;
     new_state.status_message = format!("新工程文件夹已创建：{}", project_root.display());
     new_state.recent_projects = app_state.recent_projects.clone();
     let _ = remember_recent_project(&mut new_state.recent_projects, &project_root);
@@ -2831,7 +2826,8 @@ fn open_resource_editor(
         }
         "s2tileset" => {
             let tileset = TileSet::load(path)?;
-            app_state.tile_map.tileset_path = project_relative_asset_path(path);
+            app_state.tile_map.tileset_path =
+                project_relative_asset_path(&app_state.project_root, path);
             app_state.tile_map.tile_width = tileset.tile_width;
             app_state.tile_map.tile_height = tileset.tile_height;
             app_state.tile_editor.selected_tileset = Some(tileset.clone());
@@ -3327,7 +3323,7 @@ fn draw_animation_editor(
     textures: &mut HashMap<String, egui::TextureHandle>,
 ) {
     draw_auxiliary_editor_watermark(ui, "slide2d_animation_watermark");
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let project_root = app_state.project_root.clone();
     ui.horizontal(|ui| {
         ui.label(tr("animation.name"));
         ui.text_edit_singleline(&mut app_state.animation_editor.animation.name);
@@ -3584,7 +3580,7 @@ fn draw_tilemap_editor(
     textures: &mut HashMap<String, egui::TextureHandle>,
 ) {
     draw_auxiliary_editor_watermark(ui, "slide2d_tilemap_watermark");
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let project_root = app_state.project_root.clone();
     ui.horizontal(|ui| {
         if ui.button(tr("tile.create")).clicked() {
             if let Some(image_path) = rfd::FileDialog::new()
@@ -3767,7 +3763,8 @@ fn draw_tileset_asset_entries(
                 if response.double_clicked() {
                     match TileSet::load(path) {
                         Ok(tileset) => {
-                            app_state.tile_map.tileset_path = project_relative_asset_path(path);
+                            app_state.tile_map.tileset_path =
+                                project_relative_asset_path(&app_state.project_root, path);
                             app_state.tile_map.tile_width = tileset.tile_width;
                             app_state.tile_map.tile_height = tileset.tile_height;
                             app_state.tile_editor.selected_tileset = Some(tileset);
@@ -3873,6 +3870,7 @@ fn draw_property_panel(ui: &mut egui::Ui, app_state: &mut AppState) {
         draw_ui_element_properties(ui, app_state);
         return;
     }
+    let project_root = app_state.project_root.clone();
     let selected_object = match app_state.selected_object_mut() {
         Some(game_object) => game_object,
         None => {
@@ -3919,11 +3917,7 @@ fn draw_property_panel(ui: &mut egui::Ui, app_state: &mut AppState) {
     ui.add_space(12.0);
     ui.separator();
     ui.label(tr("property.animation"));
-    let animation_files = collect_animation_files(
-        &std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join("assets/animations"),
-    );
+    let animation_files = collect_animation_files(&project_root.join("assets/animations"));
     let current_animation_name = std::path::Path::new(&selected_object.animation_path)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -3933,7 +3927,7 @@ fn draw_property_panel(ui: &mut egui::Ui, app_state: &mut AppState) {
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut selected_object.animation_path, String::new(), "未绑定");
             for animation_path in &animation_files {
-                let relative = project_relative_asset_path(animation_path);
+                let relative = project_relative_asset_path(&project_root, animation_path);
                 let name = animation_path
                     .file_stem()
                     .and_then(|value| value.to_str())
@@ -3965,6 +3959,7 @@ fn draw_property_panel(ui: &mut egui::Ui, app_state: &mut AppState) {
 
 /// 绘制选中UI元素的位置、尺寸和类型专属参数。
 fn draw_ui_element_properties(ui: &mut egui::Ui, app_state: &mut AppState) {
+    let project_root = app_state.project_root.clone();
     let element = match app_state.selected_ui_mut() {
         Some(element) => element,
         None => return,
@@ -4032,7 +4027,7 @@ fn draw_ui_element_properties(ui: &mut egui::Ui, app_state: &mut AppState) {
                     .add_filter("PNG图片", &["png"])
                     .pick_file()
                 {
-                    *image_path = project_relative_asset_path(&path);
+                    *image_path = project_relative_asset_path(&project_root, &path);
                 }
             }
         }
@@ -4319,7 +4314,7 @@ fn draw_canvas(
             .unwrap_or(canvas_rect.center());
         let scene_position = screen_to_scene(drop_position, canvas_rect, app_state);
         app_state.add_audio_object(
-            project_relative_asset_path(&audio_path),
+            project_relative_asset_path(&app_state.project_root, &audio_path),
             scene_position.x - 24.0,
             scene_position.y - 24.0,
         );
@@ -4466,7 +4461,7 @@ fn apply_animation_asset_drop(
     app_state: &mut AppState,
     editor_textures: &mut EditorTextures,
 ) -> Result<u64, String> {
-    let relative_animation = project_relative_asset_path(animation_path);
+    let relative_animation = project_relative_asset_path(&app_state.project_root, animation_path);
     if let Some(id) = find_top_object_at(drop_position, canvas_rect, app_state) {
         let object = app_state
             .game_objects
@@ -4681,9 +4676,10 @@ fn ensure_selected_tileset(app_state: &mut AppState) {
     if app_state.tile_map.tileset_path.is_empty() {
         return;
     }
-    let path = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(&app_state.tile_map.tileset_path);
+    let path = resolve_asset_path(
+        &app_state.project_root,
+        &app_state.tile_map.tileset_path,
+    );
     if let Ok(tileset) = TileSet::load(&path) {
         app_state.tile_editor.selected_tileset = Some(tileset);
         app_state.tile_editor.selected_tileset_path = Some(path);
@@ -4702,10 +4698,7 @@ fn draw_tile_map(
         Some(tileset) => tileset,
         None => return,
     };
-    let image_path = resolve_asset_path(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        &tileset.image_path,
-    );
+    let image_path = resolve_asset_path(&app_state.project_root, &tileset.image_path);
     let texture = match ensure_editor_texture(context, textures, &image_path) {
         Ok(texture) => texture,
         Err(_) => return,
@@ -4848,12 +4841,7 @@ fn fill_entire_tile_layer(app_state: &mut AppState) {
     let tile_id = app_state.tile_editor.selected_tile_id;
     let active_layer = app_state.tile_editor.active_layer;
     if let Some(layer) = app_state.tile_map.layer_mut(active_layer) {
-        layer.cells.clear();
-        for y in 0..height as i32 {
-            for x in 0..width as i32 {
-                layer.set_tile(x, y, tile_id);
-            }
-        }
+        layer.fill_entire(width, height, tile_id);
     }
 }
 
@@ -4947,7 +4935,7 @@ fn process_image_drops(
 
         // 图片中心放在鼠标松开的位置，操作体验与PPT等编辑器一致。
         app_state.add_image_object(
-            project_relative_asset_path(&pending_drop.path),
+            project_relative_asset_path(&app_state.project_root, &pending_drop.path),
             scene_position.x - display_width * 0.5,
             scene_position.y - display_height * 0.5,
             display_width,
@@ -4975,7 +4963,7 @@ fn create_image_object_from_asset(
     let display_width = original_width * scale;
     let display_height = original_height * scale;
     let scene_position = screen_to_scene(drop_position, canvas_rect, app_state);
-    let path_string = project_relative_asset_path(image_path);
+    let path_string = project_relative_asset_path(&app_state.project_root, image_path);
     app_state.add_image_object(
         path_string,
         scene_position.x - display_width * 0.5,
@@ -4988,11 +4976,7 @@ fn create_image_object_from_asset(
 }
 
 /// 将项目内资源保存为相对路径，避免场景绑定当前电脑的绝对路径。
-fn project_relative_asset_path(image_path: &std::path::Path) -> String {
-    let project_root = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(_) => return image_path.to_string_lossy().into_owned(),
-    };
+fn project_relative_asset_path(project_root: &Path, image_path: &Path) -> String {
     match image_path.strip_prefix(&project_root) {
         Ok(relative_path) => relative_path.to_string_lossy().replace('\\', "/"),
         Err(_) => image_path.to_string_lossy().into_owned(),

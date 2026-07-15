@@ -1,6 +1,7 @@
 use crate::localization::tr;
 use crate::plugins::{PluginBehavior, PluginNodeCategory, PluginNodeDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// 蓝图编辑器提供的完整常用物理按键列表。
 ///
@@ -199,6 +200,38 @@ pub struct Blueprint {
     pub connections: Vec<BlueprintConnection>,
     #[serde(default = "default_next_node_id")]
     pub next_node_id: u64,
+}
+
+/// 蓝图静态验证或运行时执行产生的诊断级别。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Warning,
+    Error,
+}
+
+/// 可由编辑器和Runtime共同展示的蓝图诊断。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlueprintDiagnostic {
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub node_id: Option<u64>,
+}
+
+impl BlueprintDiagnostic {
+    pub(crate) fn new(
+        severity: Severity,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        node_id: Option<u64>,
+    ) -> Self {
+        Self {
+            severity,
+            code: code.into(),
+            message: message.into(),
+            node_id,
+        }
+    }
 }
 
 impl Default for Blueprint {
@@ -444,6 +477,234 @@ impl Blueprint {
             connections: Vec::new(),
             next_node_id: 1,
         }
+    }
+
+    /// 静态检查蓝图格式、执行连线和变量引用，不修改原始序列化数据。
+    pub fn validate(&self) -> Vec<BlueprintDiagnostic> {
+        let mut diagnostics = Vec::new();
+        if self.slide2d_engine != blueprint_format() {
+            diagnostics.push(BlueprintDiagnostic::new(
+                Severity::Error,
+                "invalid_magic",
+                format!("无效蓝图格式标识: {}", self.slide2d_engine),
+                None,
+            ));
+        }
+
+        let mut node_by_id = HashMap::new();
+        let mut duplicate_ids = HashSet::new();
+        for node in &self.nodes {
+            if node_by_id.insert(node.id, node).is_some() && duplicate_ids.insert(node.id) {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Error,
+                    "duplicate_node_id",
+                    format!("节点ID {} 重复", node.id),
+                    Some(node.id),
+                ));
+            }
+        }
+
+        let local_variables: HashSet<&str> = self
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                BlueprintNodeKind::NumberVariable { name, .. } if !name.trim().is_empty() => {
+                    Some(name.as_str())
+                }
+                BlueprintNodeKind::PluginNode {
+                    behavior: PluginBehavior::NumberVariable,
+                    variable_name,
+                    ..
+                } if !variable_name.trim().is_empty() => Some(variable_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for node in &self.nodes {
+            match &node.kind {
+                BlueprintNodeKind::NumberVariable { name, .. } => {
+                    validate_variable_name(&mut diagnostics, node.id, name);
+                }
+                BlueprintNodeKind::GlobalNumberVariable { name, .. }
+                | BlueprintNodeKind::SetGlobalVariable { name, .. } => {
+                    validate_variable_name(&mut diagnostics, node.id, name);
+                }
+                BlueprintNodeKind::SetVariable { name, .. } => {
+                    validate_local_variable(&mut diagnostics, &local_variables, node.id, name);
+                }
+                BlueprintNodeKind::DetectTile { variable_name }
+                | BlueprintNodeKind::IfCondition {
+                    variable_name,
+                    use_global: false,
+                    ..
+                } => {
+                    validate_local_variable(
+                        &mut diagnostics,
+                        &local_variables,
+                        node.id,
+                        variable_name,
+                    );
+                }
+                BlueprintNodeKind::IfCondition {
+                    variable_name,
+                    use_global: true,
+                    ..
+                } => validate_variable_name(&mut diagnostics, node.id, variable_name),
+                BlueprintNodeKind::CompareVariables {
+                    left_name,
+                    right_name,
+                    use_global,
+                    ..
+                } => {
+                    if *use_global {
+                        validate_variable_name(&mut diagnostics, node.id, left_name);
+                        validate_variable_name(&mut diagnostics, node.id, right_name);
+                    } else {
+                        validate_local_variable(
+                            &mut diagnostics,
+                            &local_variables,
+                            node.id,
+                            left_name,
+                        );
+                        validate_local_variable(
+                            &mut diagnostics,
+                            &local_variables,
+                            node.id,
+                            right_name,
+                        );
+                    }
+                }
+                BlueprintNodeKind::PluginNode {
+                    behavior,
+                    variable_name,
+                    ..
+                } if matches!(behavior, PluginBehavior::NumberVariable) => {
+                    validate_variable_name(&mut diagnostics, node.id, variable_name)
+                }
+                BlueprintNodeKind::PluginNode {
+                    behavior,
+                    variable_name,
+                    ..
+                } if matches!(
+                    behavior,
+                    PluginBehavior::PickupCheck | PluginBehavior::SetObjectVariable
+                ) =>
+                {
+                    validate_local_variable(
+                        &mut diagnostics,
+                        &local_variables,
+                        node.id,
+                        variable_name,
+                    )
+                }
+                BlueprintNodeKind::PluginNode {
+                    behavior: PluginBehavior::SetGlobalVariable,
+                    variable_name,
+                    ..
+                } => validate_variable_name(&mut diagnostics, node.id, variable_name),
+                _ => {}
+            }
+        }
+
+        let mut outgoing: HashMap<u64, Vec<u64>> = HashMap::new();
+        for connection in &self.connections {
+            let source = node_by_id.get(&connection.from_node_id).copied();
+            let target = node_by_id.get(&connection.to_node_id).copied();
+            if source.is_none() || target.is_none() {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Error,
+                    "invalid_connection_node",
+                    format!(
+                        "连线 {} -> {} 引用了不存在的节点",
+                        connection.from_node_id, connection.to_node_id
+                    ),
+                    source
+                        .map(|node| node.id)
+                        .or_else(|| target.map(|node| node.id)),
+                ));
+                continue;
+            }
+            let source = source.expect("已检查源节点");
+            let target = target.expect("已检查目标节点");
+            if !source.kind.has_execution_output() || !target.kind.has_execution_input() {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Error,
+                    "invalid_connection_direction",
+                    format!("连线 {} -> {} 的执行方向无效", source.id, target.id),
+                    Some(source.id),
+                ));
+                continue;
+            }
+            let port_is_valid = if source.kind.uses_branch_outputs() {
+                matches!(connection.from_port, 1 | 2)
+            } else {
+                connection.from_port == 0
+            };
+            if !port_is_valid {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Error,
+                    "invalid_connection_port",
+                    format!(
+                        "节点 {} 的输出端口 {} 无效",
+                        source.id, connection.from_port
+                    ),
+                    Some(source.id),
+                ));
+                continue;
+            }
+            outgoing.entry(source.id).or_default().push(target.id);
+        }
+
+        let event_ids: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|node| node.kind.category() == BlueprintNodeCategory::Event)
+            .map(|node| node.id)
+            .collect();
+        if event_ids.is_empty()
+            && self
+                .nodes
+                .iter()
+                .any(|node| node.kind.has_execution_input())
+        {
+            diagnostics.push(BlueprintDiagnostic::new(
+                Severity::Warning,
+                "no_event_entry",
+                "执行图没有事件入口",
+                None,
+            ));
+        }
+        let mut reachable = HashSet::new();
+        let mut pending = event_ids.clone();
+        while let Some(node_id) = pending.pop() {
+            if reachable.insert(node_id) {
+                pending.extend(outgoing.get(&node_id).into_iter().flatten().copied());
+            }
+        }
+        for node in &self.nodes {
+            if node.kind.has_execution_input() && !reachable.contains(&node.id) {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Warning,
+                    "unreachable_from_event",
+                    format!("执行节点 {} 无法从任何事件到达", node.id),
+                    Some(node.id),
+                ));
+            }
+        }
+
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        for node in &self.nodes {
+            if execution_cycle(node.id, &outgoing, &mut visiting, &mut visited) {
+                diagnostics.push(BlueprintDiagnostic::new(
+                    Severity::Warning,
+                    "execution_cycle",
+                    "执行图包含循环，可能触发单帧执行上限",
+                    Some(node.id),
+                ));
+                break;
+            }
+        }
+        diagnostics
     }
 
     /// 添加“键盘按下”事件节点，默认监听W键。
@@ -753,6 +1014,56 @@ impl Blueprint {
     }
 }
 
+fn validate_variable_name(diagnostics: &mut Vec<BlueprintDiagnostic>, node_id: u64, name: &str) {
+    if name.trim().is_empty() {
+        diagnostics.push(BlueprintDiagnostic::new(
+            Severity::Error,
+            "empty_variable_name",
+            "变量名不能为空",
+            Some(node_id),
+        ));
+    }
+}
+
+fn validate_local_variable(
+    diagnostics: &mut Vec<BlueprintDiagnostic>,
+    local_variables: &HashSet<&str>,
+    node_id: u64,
+    name: &str,
+) {
+    validate_variable_name(diagnostics, node_id, name);
+    if !name.trim().is_empty() && !local_variables.contains(name) {
+        diagnostics.push(BlueprintDiagnostic::new(
+            Severity::Error,
+            "undeclared_local_variable",
+            format!("局部变量 {name} 未声明"),
+            Some(node_id),
+        ));
+    }
+}
+
+fn execution_cycle(
+    node_id: u64,
+    outgoing: &HashMap<u64, Vec<u64>>,
+    visiting: &mut HashSet<u64>,
+    visited: &mut HashSet<u64>,
+) -> bool {
+    if visiting.contains(&node_id) {
+        return true;
+    }
+    if !visited.insert(node_id) {
+        return false;
+    }
+    visiting.insert(node_id);
+    let has_cycle = outgoing
+        .get(&node_id)
+        .into_iter()
+        .flatten()
+        .any(|next| execution_cycle(*next, outgoing, visiting, visited));
+    visiting.remove(&node_id);
+    has_cycle
+}
+
 /// 返回蓝图文件固定的Slide2D格式标识。
 fn blueprint_format() -> String {
     "SLIDE2D_BLUEPRINT".to_owned()
@@ -848,5 +1159,77 @@ mod tests {
             .connections
             .iter()
             .any(|connection| connection.from_node_id == 2 && connection.to_node_id == 3));
+    }
+
+    #[test]
+    fn validation_reports_structure_and_variable_errors() {
+        let blueprint = Blueprint {
+            slide2d_engine: "WRONG".to_owned(),
+            nodes: vec![
+                BlueprintNode {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    kind: BlueprintNodeKind::FrameUpdated,
+                },
+                BlueprintNode {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    kind: BlueprintNodeKind::SetVariable {
+                        name: "missing".to_owned(),
+                        value: 1.0,
+                    },
+                },
+                BlueprintNode {
+                    id: 2,
+                    x: 0.0,
+                    y: 0.0,
+                    kind: BlueprintNodeKind::ModifyPosition {
+                        delta_x: 0.0,
+                        delta_y: 0.0,
+                    },
+                },
+            ],
+            connections: vec![BlueprintConnection {
+                from_node_id: 99,
+                to_node_id: 1,
+                from_port: 3,
+            }],
+            next_node_id: 3,
+        };
+
+        let codes: HashSet<_> = blueprint
+            .validate()
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(codes.contains("invalid_magic"));
+        assert!(codes.contains("duplicate_node_id"));
+        assert!(codes.contains("invalid_connection_node"));
+        assert!(codes.contains("undeclared_local_variable"));
+        assert!(codes.contains("unreachable_from_event"));
+    }
+
+    #[test]
+    fn validation_warns_about_execution_cycles() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_frame_updated_node();
+        blueprint.add_kind(BlueprintNodeKind::ModifyPosition {
+            delta_x: 1.0,
+            delta_y: 0.0,
+        });
+        blueprint.add_kind(BlueprintNodeKind::ModifyPosition {
+            delta_x: 1.0,
+            delta_y: 0.0,
+        });
+        blueprint.connect(1, 2);
+        blueprint.connect(2, 3);
+        blueprint.connect(3, 2);
+
+        assert!(blueprint
+            .validate()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "execution_cycle"));
     }
 }

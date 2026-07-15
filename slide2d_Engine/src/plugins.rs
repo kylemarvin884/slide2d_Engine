@@ -1,7 +1,7 @@
 //! Slide2D声明式插件系统，只读取配置并执行引擎白名单能力，不加载脚本或动态代码。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ pub const PLUGIN_MAGIC: &str = "SLIDE2D_PLUGIN_SYSTEM";
 pub const OFFICIAL_PICKUP_PLUGIN_ID: &str = "slide2d.official.pickup";
 
 /// 插件节点在蓝图中的分类。
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Serialize, Deserialize, PartialEq)]
 pub enum PluginNodeCategory {
     Event,
     Logic,
@@ -20,7 +20,7 @@ pub enum PluginNodeCategory {
 }
 
 /// 插件节点可选择的Runtime白名单行为。
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Serialize, Deserialize, PartialEq)]
 pub enum PluginBehavior {
     /// 场景加载完成时触发的插件事件。
     SceneLoadedEvent,
@@ -103,6 +103,27 @@ pub struct PluginRegistry {
     pub installed: Vec<InstalledPlugin>,
 }
 
+/// 单个启用插件允许Runtime执行的节点和白名单行为。
+#[derive(Clone, Default)]
+pub struct PluginRuntimeAuthorization {
+    capabilities: HashSet<String>,
+    nodes: HashMap<String, String>,
+}
+
+/// 由已验证PluginRegistry构建、供蓝图VM使用的可信授权映射。
+pub type PluginAuthorizationMap = HashMap<String, PluginRuntimeAuthorization>;
+
+impl PluginRuntimeAuthorization {
+    /// 只有节点存在、蓝图behavior与manifest一致且能力已声明时才授权。
+    pub fn allows(&self, node_type: &str, behavior: &PluginBehavior) -> bool {
+        let Ok(serialized_behavior) = serde_json::to_string(behavior) else {
+            return false;
+        };
+        self.nodes.get(node_type) == Some(&serialized_behavior)
+            && self.capabilities.contains(&serialized_behavior)
+    }
+}
+
 impl PluginRegistry {
     /// 创建新工程注册表，默认启用官方道具拾取示例插件。
     pub fn load_new_project(project_root: PathBuf) -> Self {
@@ -112,9 +133,24 @@ impl PluginRegistry {
 
     /// 扫描项目plugins目录，并按工程保存的ID集合恢复启用状态。
     pub fn load(project_root: PathBuf, enabled_ids: &HashSet<String>) -> Self {
+        Self::scan(project_root, Some(enabled_ids), true)
+    }
+
+    /// 裸场景只扫描相邻的现有plugins目录，不创建或隐式安装任何插件。
+    pub fn load_adjacent(project_root: PathBuf) -> Self {
+        Self::scan(project_root, None, false)
+    }
+
+    fn scan(
+        project_root: PathBuf,
+        enabled_ids: Option<&HashSet<String>>,
+        install_official: bool,
+    ) -> Self {
         let plugins_root = project_root.join("plugins");
-        let _ = fs::create_dir_all(&plugins_root);
-        let _ = install_official_pickup_plugin(&plugins_root);
+        if install_official {
+            let _ = fs::create_dir_all(&plugins_root);
+            let _ = install_official_pickup_plugin(&plugins_root);
+        }
         let mut installed = Vec::new();
         if let Ok(entries) = fs::read_dir(&plugins_root) {
             for entry in entries.flatten() {
@@ -125,7 +161,9 @@ impl PluginRegistry {
                 let manifest_path = directory.join("plugin.json");
                 match load_manifest(&manifest_path) {
                     Ok(manifest) => {
-                        let enabled = enabled_ids.contains(&manifest.plugin_id);
+                        let enabled = enabled_ids
+                            .map(|ids| ids.contains(&manifest.plugin_id))
+                            .unwrap_or(true);
                         installed.push(InstalledPlugin {
                             manifest,
                             directory,
@@ -140,6 +178,26 @@ impl PluginRegistry {
                         load_error: Some(error),
                     }),
                 }
+            }
+        }
+        let mut plugin_id_counts = HashMap::new();
+        for plugin in installed
+            .iter()
+            .filter(|plugin| plugin.load_error.is_none())
+        {
+            *plugin_id_counts
+                .entry(plugin.manifest.plugin_id.clone())
+                .or_insert(0_usize) += 1;
+        }
+        for plugin in &mut installed {
+            if plugin.load_error.is_none()
+                && plugin_id_counts.get(&plugin.manifest.plugin_id).copied() != Some(1)
+            {
+                plugin.enabled = false;
+                plugin.load_error = Some(format!(
+                    "发现重复插件ID：{}",
+                    plugin.manifest.plugin_id
+                ));
             }
         }
         installed.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
@@ -173,6 +231,41 @@ impl PluginRegistry {
         nodes
     }
 
+    /// 从已验证且启用的manifest构建Runtime唯一可信的插件节点授权。
+    pub fn runtime_authorizations(&self) -> PluginAuthorizationMap {
+        let mut authorizations = HashMap::new();
+        for plugin in self
+            .installed
+            .iter()
+            .filter(|plugin| plugin.enabled && plugin.load_error.is_none())
+        {
+            let capabilities = plugin
+                .manifest
+                .runtime_capabilities
+                .iter()
+                .filter_map(|behavior| serde_json::to_string(behavior).ok())
+                .collect();
+            let nodes = plugin
+                .manifest
+                .nodes
+                .iter()
+                .filter_map(|node| {
+                    serde_json::to_string(&node.behavior)
+                        .ok()
+                        .map(|behavior| (node.node_type.clone(), behavior))
+                })
+                .collect();
+            authorizations.insert(
+                plugin.manifest.plugin_id.clone(),
+                PluginRuntimeAuthorization {
+                    capabilities,
+                    nodes,
+                },
+            );
+        }
+        authorizations
+    }
+
     /// 切换一个插件的启用状态，下一次UI绘制和Runtime启动立即使用新状态。
     pub fn set_enabled(&mut self, plugin_id: &str, enabled: bool) {
         if let Some(plugin) = self
@@ -202,6 +295,27 @@ pub fn load_manifest(path: &Path) -> Result<PluginManifest, String> {
     }
     if manifest.plugin_id.trim().is_empty() || manifest.name.trim().is_empty() {
         return Err("plugin.json缺少插件ID或名称".to_owned());
+    }
+    let mut capabilities = HashSet::new();
+    for behavior in &manifest.runtime_capabilities {
+        if !capabilities.insert(behavior.clone()) {
+            return Err(format!("插件包含重复Runtime能力：{behavior:?}"));
+        }
+    }
+    let mut node_types = HashSet::new();
+    for node in &manifest.nodes {
+        if node.node_type.trim().is_empty() {
+            return Err("插件节点node_type不能为空".to_owned());
+        }
+        if !node_types.insert(node.node_type.clone()) {
+            return Err(format!("插件包含重复node_type：{}", node.node_type));
+        }
+        if !capabilities.contains(&node.behavior) {
+            return Err(format!(
+                "插件节点{}的behavior未列入runtime_capabilities",
+                node.node_type
+            ));
+        }
     }
     for resource in &manifest.resources {
         let folder = Path::new(&resource.folder);
@@ -322,6 +436,47 @@ fn default_variable_name() -> String {
 mod tests {
     use super::*;
 
+    fn valid_manifest() -> PluginManifest {
+        PluginManifest {
+            slide2d_plugin_system: PLUGIN_MAGIC.to_owned(),
+            plugin_id: "test.plugin".to_owned(),
+            name: "Test".to_owned(),
+            version: "1".to_owned(),
+            author: "Test".to_owned(),
+            description: "Test".to_owned(),
+            nodes: vec![PluginNodeDefinition {
+                node_type: "set_value".to_owned(),
+                display_name: "Set value".to_owned(),
+                description: "Test".to_owned(),
+                category: PluginNodeCategory::Action,
+                behavior: PluginBehavior::SetObjectVariable,
+                variable_name: "value".to_owned(),
+                value: 1.0,
+            }],
+            resources: Vec::new(),
+            editor_tools: Vec::new(),
+            runtime_capabilities: vec![PluginBehavior::SetObjectVariable],
+        }
+    }
+
+    fn write_manifest(root: &Path, manifest: &PluginManifest) -> PathBuf {
+        fs::create_dir_all(root).expect("应创建插件测试目录");
+        let path = root.join("plugin.json");
+        fs::write(&path, serde_json::to_vec(manifest).unwrap()).expect("应写入plugin.json");
+        path
+    }
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "slide2d_plugin_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
     /// 验证官方插件会自动安装并默认启用拾取节点。
     #[test]
     fn official_pickup_plugin_is_installed() {
@@ -349,5 +504,60 @@ mod tests {
             .expect("应写入测试配置");
         assert!(load_manifest(&path).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_node_and_capability_declarations_are_rejected() {
+        let cases = [
+            {
+                let mut manifest = valid_manifest();
+                manifest.nodes[0].node_type.clear();
+                manifest
+            },
+            {
+                let mut manifest = valid_manifest();
+                manifest.nodes.push(manifest.nodes[0].clone());
+                manifest
+            },
+            {
+                let mut manifest = valid_manifest();
+                manifest.runtime_capabilities.clear();
+                manifest
+            },
+            {
+                let mut manifest = valid_manifest();
+                manifest
+                    .runtime_capabilities
+                    .push(PluginBehavior::SetObjectVariable);
+                manifest
+            },
+        ];
+
+        for (index, manifest) in cases.iter().enumerate() {
+            let root = unique_test_directory(&format!("invalid_{index}"));
+            let path = write_manifest(&root, manifest);
+            assert!(load_manifest(&path).is_err());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn noncompliant_installed_plugin_has_load_error() {
+        let root = unique_test_directory("load_error");
+        let plugin_directory = root.join("plugins/bad_plugin");
+        let mut manifest = valid_manifest();
+        manifest.runtime_capabilities.clear();
+        write_manifest(&plugin_directory, &manifest);
+
+        let registry = PluginRegistry::load(root.clone(), &HashSet::from([manifest.plugin_id]));
+        let plugin = registry
+            .installed
+            .iter()
+            .find(|plugin| plugin.directory == plugin_directory)
+            .expect("不合规插件目录仍应显示");
+
+        assert!(!plugin.enabled);
+        assert!(plugin.load_error.is_some());
+        let _ = fs::remove_dir_all(root);
     }
 }

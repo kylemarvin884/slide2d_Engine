@@ -1,8 +1,9 @@
 //! Slide2D工程文件的保存、打开和资源打包。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::app_state::{AppState, AssistantSettings, PerformanceSettings, Scene};
@@ -72,15 +73,16 @@ fn recent_projects_path() -> PathBuf {
     std::env::temp_dir().join("slide2d_recent_projects.json")
 }
 
-/// 旧工程缺少标识字段时补上Slide2D标识，保持向后兼容。
-fn default_project_magic() -> String {
-    PROJECT_MAGIC.to_owned()
-}
-
-/// 验证主工程JSON内置的Slide2D引擎标识。
+/// 验证主工程JSON内置的Slide2D引擎标识和版本。
 fn validate_project_identity(project: &Slide2dProject) -> Result<(), String> {
     if project.slide2d_engine != PROJECT_MAGIC {
         return Err("工程文件缺少有效的Slide2D引擎标识".to_owned());
+    }
+    if project.format_version != PROJECT_FORMAT_VERSION {
+        return Err(format!(
+            "工程格式版本{}不受支持，当前版本为{}",
+            project.format_version, PROJECT_FORMAT_VERSION
+        ));
     }
     Ok(())
 }
@@ -112,7 +114,6 @@ pub struct PackedDirectory {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Slide2dProject {
     /// 固定的Slide2D格式标识，避免普通JSON被误认为工程文件。
-    #[serde(default = "default_project_magic")]
     pub slide2d_engine: String,
     pub format_version: u32,
     pub name: String,
@@ -156,7 +157,11 @@ fn default_assistant_settings() -> AssistantSettings {
 
 /// 旧工程使用的默认场景分类。
 fn default_scene_categories() -> Vec<String> {
-    vec!["Main Menu".to_owned(), "Levels".to_owned(), "Ending".to_owned()]
+    vec![
+        "Main Menu".to_owned(),
+        "Levels".to_owned(),
+        "Ending".to_owned(),
+    ]
 }
 
 /// 把缺少扩展名的路径自动补成.slide2d。
@@ -216,12 +221,7 @@ pub fn save_project(app_state: &mut AppState, path: &Path) -> Result<(), String>
     };
     let json = serde_json::to_vec_pretty(&project)
         .map_err(|error| format!("生成工程文件失败：{error}"))?;
-    let temporary_path = path.with_extension("slide2d.tmp");
-    fs::write(&temporary_path, json).map_err(|error| format!("写入工程临时文件失败：{error}"))?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("替换旧工程文件失败：{error}"))?;
-    }
-    fs::rename(&temporary_path, path).map_err(|error| format!("完成工程保存失败：{error}"))?;
+    atomic_write(path, &json).map_err(|error| format!("保存工程文件失败：{error}"))?;
     app_state.project_file_path = Some(path.to_path_buf());
     write_scene_files(app_state)?;
     Ok(())
@@ -268,7 +268,7 @@ pub fn save_project_folder(app_state: &mut AppState, folder: &Path) -> Result<()
     };
     let json = serde_json::to_vec_pretty(&project)
         .map_err(|error| format!("生成工程清单失败：{error}"))?;
-    fs::write(folder.join(PROJECT_MANIFEST_NAME), json)
+    atomic_write(&folder.join(PROJECT_MANIFEST_NAME), &json)
         .map_err(|error| format!("写入工程清单失败：{error}"))?;
     write_scene_files(app_state)?;
     let package_name = project_package_name(folder);
@@ -296,8 +296,7 @@ pub fn open_project_folder(folder: &Path) -> Result<AppState, String> {
         ));
     }
     let bytes = fs::read(&manifest_path).map_err(|error| format!("读取工程清单失败：{error}"))?;
-    let project: Slide2dProject =
-        serde_json::from_slice(&bytes).map_err(|error| format!("解析工程清单失败：{error}"))?;
+    let project = parse_project(&bytes).map_err(|error| format!("解析工程清单失败：{error}"))?;
     if project.scenes.is_empty() {
         return Err("工程中没有可用场景".to_owned());
     }
@@ -358,9 +357,8 @@ fn open_verified_project_folder(
     if actual_checksum != verification.checksum {
         return Err("工程验证失败：主工程文件校验值不一致，文件可能已损坏".to_owned());
     }
-    let project: Slide2dProject = serde_json::from_slice(&package_bytes)
+    let project = parse_project(&package_bytes)
         .map_err(|error| format!("解析主.slide2d工程文件失败：{error}"))?;
-    validate_project_identity(&project)?;
     restore_project_to_folder(project, folder)
 }
 
@@ -430,7 +428,7 @@ fn write_verification_file(
     };
     let json = serde_json::to_vec_pretty(&verification)
         .map_err(|error| format!("生成工程验证文件失败：{error}"))?;
-    fs::write(folder.join(PROJECT_VERIFICATION_NAME), json)
+    atomic_write(&folder.join(PROJECT_VERIFICATION_NAME), &json)
         .map_err(|error| format!("写入工程验证文件失败：{error}"))
 }
 
@@ -468,9 +466,7 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
 /// 打开.slide2d文件，并将内嵌素材恢复到工程专属工作目录。
 pub fn open_project(path: &Path) -> Result<AppState, String> {
     let bytes = fs::read(path).map_err(|error| format!("读取工程文件失败：{error}"))?;
-    let project: Slide2dProject =
-        serde_json::from_slice(&bytes).map_err(|error| format!("解析工程文件失败：{error}"))?;
-    validate_project_identity(&project)?;
+    let project = parse_project(&bytes).map_err(|error| format!("解析工程文件失败：{error}"))?;
     if project.scenes.is_empty() {
         return Err("工程中没有可用场景".to_owned());
     }
@@ -526,14 +522,123 @@ pub fn workspace_path(path: &Path) -> PathBuf {
 pub fn write_scene_files(app_state: &AppState) -> Result<(), String> {
     let directory = app_state.project_root.join("scenes");
     fs::create_dir_all(&directory).map_err(|error| format!("创建场景目录失败：{error}"))?;
-    for (index, scene) in app_state.project_scenes.iter().enumerate() {
-        let safe_name = sanitize_file_name(&scene.name, index);
+    for scene in &app_state.project_scenes {
         let json = serde_json::to_vec_pretty(scene)
             .map_err(|error| format!("生成场景JSON失败：{error}"))?;
-        fs::write(directory.join(format!("{safe_name}.json")), json)
+        atomic_write(&directory.join(format!("{}.json", scene.scene_id)), &json)
             .map_err(|error| format!("写入场景文件失败：{error}"))?;
     }
     Ok(())
+}
+
+/// 严格读取当前格式，或显式识别并迁移缺少magic的version 0旧工程。
+fn parse_project(bytes: &[u8]) -> Result<Slide2dProject, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "工程根节点必须是JSON对象".to_owned())?;
+    match object.get("slide2d_engine") {
+        Some(_) => {}
+        None => {
+            let legacy_version = match object.get("format_version") {
+                None => 0,
+                Some(value) => value
+                    .as_u64()
+                    .ok_or_else(|| "legacy工程格式版本必须是整数0".to_owned())?,
+            };
+            if legacy_version != 0 {
+                return Err("缺少Slide2D标识的工程仅允许使用legacy version 0".to_owned());
+            }
+            object.insert(
+                "slide2d_engine".to_owned(),
+                serde_json::Value::String(PROJECT_MAGIC.to_owned()),
+            );
+            object.insert(
+                "format_version".to_owned(),
+                serde_json::Value::from(PROJECT_FORMAT_VERSION),
+            );
+        }
+    }
+    let mut project: Slide2dProject =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    validate_project_identity(&project)?;
+    migrate_scene_ids(&mut project.scenes);
+    Ok(project)
+}
+
+/// 为旧工程中的空、重复或不安全场景ID分配确定且互不冲突的新ID。
+fn migrate_scene_ids(scenes: &mut [Scene]) {
+    let mut used = HashSet::new();
+    let mut next_number = 1_u64;
+    for scene in scenes {
+        let valid = !scene.scene_id.is_empty()
+            && scene.scene_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            });
+        if valid && used.insert(scene.scene_id.clone()) {
+            continue;
+        }
+        loop {
+            let candidate = format!("scene_{next_number:06}");
+            next_number += 1;
+            if used.insert(candidate.clone()) {
+                scene.scene_id = candidate;
+                break;
+            }
+        }
+    }
+}
+
+/// 在目标文件同目录持久化临时文件，并通过备份重命名实现Windows安全替换。
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| format!("创建目标目录失败：{error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "目标文件名无效".to_owned())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary_path = parent.join(format!(".{file_name}.{nonce}.tmp"));
+    let backup_path = parent.join(format!(".{file_name}.{nonce}.bak"));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut temporary =
+            File::create(&temporary_path).map_err(|error| format!("创建临时文件失败：{error}"))?;
+        temporary
+            .write_all(bytes)
+            .map_err(|error| format!("写入临时文件失败：{error}"))?;
+        temporary
+            .flush()
+            .map_err(|error| format!("刷新临时文件失败：{error}"))?;
+        temporary
+            .sync_all()
+            .map_err(|error| format!("同步临时文件失败：{error}"))?;
+        drop(temporary);
+
+        let had_original = path.exists();
+        if had_original {
+            fs::rename(path, &backup_path).map_err(|error| format!("备份旧文件失败：{error}"))?;
+        }
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            if had_original {
+                let _ = fs::rename(&backup_path, path);
+            }
+            return Err(format!("替换目标文件失败：{error}"));
+        }
+        if had_original {
+            let _ = fs::remove_file(&backup_path);
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
 }
 
 /// 递归收集assets目录中的所有普通文件。
@@ -720,6 +825,77 @@ mod tests {
         let restored_root = restored.project_root.clone();
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(restored_root);
+    }
+
+    #[test]
+    fn project_identity_is_strict_and_version_zero_is_migrated_explicitly() {
+        let state = AppState::new();
+        let mut current = serde_json::to_value(Slide2dProject {
+            slide2d_engine: PROJECT_MAGIC.to_owned(),
+            format_version: PROJECT_FORMAT_VERSION,
+            name: "test".to_owned(),
+            startup_scene_name: "场景1".to_owned(),
+            active_scene_name: "场景1".to_owned(),
+            scenes: state.project_scenes.clone(),
+            scene_categories: Vec::new(),
+            global_variables: HashMap::new(),
+            assets: Vec::new(),
+            asset_directories: Vec::new(),
+            enabled_plugins: HashSet::new(),
+            performance_settings: PerformanceSettings::new(),
+            assistant_settings: AssistantSettings::new(),
+        })
+        .expect("工程应可序列化");
+
+        current.as_object_mut().unwrap().remove("slide2d_engine");
+        assert!(parse_project(&serde_json::to_vec(&current).unwrap()).is_err());
+
+        current["format_version"] = serde_json::Value::from(0);
+        let migrated = parse_project(&serde_json::to_vec(&current).unwrap())
+            .expect("version 0旧工程应显式迁移");
+        assert_eq!(migrated.slide2d_engine, PROJECT_MAGIC);
+        assert_eq!(migrated.format_version, PROJECT_FORMAT_VERSION);
+
+        current["slide2d_engine"] = serde_json::Value::String("WRONG".to_owned());
+        assert!(parse_project(&serde_json::to_vec(&current).unwrap()).is_err());
+    }
+
+    #[test]
+    fn duplicate_and_empty_scene_ids_are_migrated_and_used_as_file_names() {
+        let root = unique_test_directory("scene_ids");
+        let mut state = AppState::new();
+        state.project_root = root.clone();
+        state.project_scenes[0].scene_id.clear();
+        state.project_scenes.push(Scene::empty("Second"));
+        state.project_scenes[1].scene_id = String::new();
+
+        migrate_scene_ids(&mut state.project_scenes);
+        assert!(!state.project_scenes[0].scene_id.is_empty());
+        assert_ne!(
+            state.project_scenes[0].scene_id,
+            state.project_scenes[1].scene_id
+        );
+        write_scene_files(&state).expect("场景文件应写入");
+        for scene in &state.project_scenes {
+            assert!(root
+                .join("scenes")
+                .join(format!("{}.json", scene.scene_id))
+                .exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let root = unique_test_directory("atomic_write");
+        fs::create_dir_all(&root).expect("应创建目录");
+        let path = root.join("data.json");
+        fs::write(&path, b"old").expect("应写入旧文件");
+
+        atomic_write(&path, b"new").expect("应安全替换文件");
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// 创建不会与其他测试冲突的临时目录。

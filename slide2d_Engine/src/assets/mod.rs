@@ -683,6 +683,7 @@ mod tests {
             blueprint: Blueprint::new(),
             blueprint_file: "blueprint_7.json".to_owned(),
             variables: std::collections::HashMap::new(),
+            persistent: false,
         };
         let actor = ActorAsset::from_game_object("Player".to_owned(), &object);
         actor.save(&path).expect("Actor应保存成功");

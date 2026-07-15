@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::animation::AnimationEditorState;
@@ -89,7 +90,11 @@ pub struct SceneCameraState {
 impl SceneCameraState {
     /// 创建默认场景视角。
     pub fn new() -> Self {
-        Self { offset_x: 0.0, offset_y: 0.0, zoom: 1.0 }
+        Self {
+            offset_x: 0.0,
+            offset_y: 0.0,
+            zoom: 1.0,
+        }
     }
 }
 
@@ -448,7 +453,11 @@ impl AppState {
             project_scenes: vec![Scene::empty("场景1")],
             active_scene_index: 0,
             startup_scene_name: "场景1".to_owned(),
-            scene_categories: vec!["Main Menu".to_owned(), "Levels".to_owned(), "Ending".to_owned()],
+            scene_categories: vec![
+                "Main Menu".to_owned(),
+                "Levels".to_owned(),
+                "Ending".to_owned(),
+            ],
             global_variables: HashMap::new(),
             project_file_path: None,
             project_root,
@@ -482,43 +491,63 @@ impl AppState {
         let mut state = Self::new();
         state.project_scenes = vec![scene.clone()];
         state.startup_scene_name = scene.name.clone();
-        state.game_objects = scene.game_objects;
-        state.tile_map = scene.tile_map;
-        state.ui_elements = scene.ui_elements;
-        for object in &mut state.game_objects {
+        state.load_scene_document(scene);
+        state
+    }
+
+    /// 只替换当前场景拥有的文档和交互状态，保留编辑器窗口、工具与用户设置。
+    fn load_scene_document(&mut self, scene: Scene) {
+        self.view_offset_x = scene.editor_camera.offset_x;
+        self.view_offset_y = scene.editor_camera.offset_y;
+        self.view_zoom = scene.editor_camera.zoom;
+        self.game_objects = scene.game_objects;
+        self.tile_map = scene.tile_map;
+        self.ui_elements = scene.ui_elements;
+        for object in &mut self.game_objects {
             if object.blueprint_file.is_empty() {
                 object.blueprint_file = format!("blueprint_{}.json", object.id);
             }
         }
-        state.next_object_id = state
+        self.next_object_id = self
             .game_objects
             .iter()
             .map(|object| object.id)
             .max()
             .unwrap_or(0)
             + 1;
-        state.next_layer_index = state
+        self.next_layer_index = self
             .game_objects
             .iter()
             .map(|object| object.layer_index)
             .max()
             .unwrap_or(0)
             + 1;
-        state.next_ui_id = state
+        self.next_ui_id = self
             .ui_elements
             .iter()
             .map(|element| element.id)
             .max()
             .unwrap_or(0)
             + 1;
-        state.next_ui_layer = state
+        self.next_ui_layer = self
             .ui_elements
             .iter()
             .map(|element| element.layer_index)
             .max()
             .unwrap_or(0)
             + 1;
-        state
+        self.selected_object_id = None;
+        self.selected_object_ids.clear();
+        self.selected_ui_id = None;
+        self.object_interaction = None;
+        self.blueprint_object_id = None;
+        self.blueprint_ui_id = None;
+        self.pending_blueprint_output = None;
+        self.pending_blueprint_output_port = 0;
+        self.selected_blueprint_node_id = None;
+        self.selected_blueprint_node_ids.clear();
+        self.dragging_ui_template = None;
+        self.tile_editor.rectangle_start = None;
     }
 
     /// 使用图片信息创建一个新的场景物体，并自动放到最高图层。
@@ -616,17 +645,26 @@ impl AppState {
         Scene {
             slide2d_engine: scene_format(),
             name: self.active_scene_name().to_owned(),
-            scene_id: self.project_scenes.get(self.active_scene_index)
-                .map(|scene| scene.scene_id.clone()).unwrap_or_else(|| self.next_scene_id()),
-            category: self.project_scenes.get(self.active_scene_index)
-                .map(|scene| scene.category.clone()).unwrap_or_else(default_scene_category),
+            scene_id: self
+                .project_scenes
+                .get(self.active_scene_index)
+                .map(|scene| scene.scene_id.clone())
+                .unwrap_or_else(|| self.next_scene_id()),
+            category: self
+                .project_scenes
+                .get(self.active_scene_index)
+                .map(|scene| scene.category.clone())
+                .unwrap_or_else(default_scene_category),
             editor_camera: SceneCameraState {
                 offset_x: self.view_offset_x,
                 offset_y: self.view_offset_y,
                 zoom: self.view_zoom,
             },
-            camera_snapshots: self.project_scenes.get(self.active_scene_index)
-                .map(|scene| scene.camera_snapshots.clone()).unwrap_or_default(),
+            camera_snapshots: self
+                .project_scenes
+                .get(self.active_scene_index)
+                .map(|scene| scene.camera_snapshots.clone())
+                .unwrap_or_default(),
             game_objects: self.game_objects.clone(),
             tile_map: self.tile_map.clone(),
             ui_elements: self.ui_elements.clone(),
@@ -697,54 +735,30 @@ impl AppState {
         }
         self.store_active_scene();
         let scene = self.project_scenes[scene_index].clone();
-        let target_camera = scene.editor_camera.clone();
-        let project_data = (
-            self.project_scenes.clone(),
-            self.startup_scene_name.clone(),
-            self.scene_categories.clone(),
-            self.global_variables.clone(),
-            self.project_file_path.clone(),
-            self.project_root.clone(),
-            self.recent_projects.clone(),
-            self.saved_project_snapshot.clone(),
-            self.plugin_registry.clone(),
-            self.performance_settings.clone(),
-            self.assistant_settings.clone(),
-        );
-        let mut restored = Self::from_scene(scene);
-        restored.project_scenes = project_data.0;
-        restored.active_scene_index = scene_index;
-        restored.startup_scene_name = project_data.1;
-        restored.scene_categories = project_data.2;
-        restored.global_variables = project_data.3;
-        restored.project_file_path = project_data.4;
-        restored.project_root = project_data.5;
-        restored.recent_projects = project_data.6;
-        restored.saved_project_snapshot = project_data.7;
-        restored.plugin_registry = project_data.8;
-        restored.performance_settings = project_data.9;
-        restored.assistant_settings = project_data.10;
-        restored.grid_size = restored.assistant_settings.grid_size;
-        restored.view_offset_x = target_camera.offset_x;
-        restored.view_offset_y = target_camera.offset_y;
-        restored.view_zoom = target_camera.zoom;
-        restored.status_message = format!("已切换场景：{}", restored.active_scene_name());
-        *self = restored;
+        self.active_scene_index = scene_index;
+        self.load_scene_document(scene);
+        self.status_message = format!("已切换场景：{}", self.active_scene_name());
     }
 
     /// 新建一个空场景并立即切换过去。
     pub fn add_scene(&mut self, name: String) {
         self.store_active_scene();
-        let final_name = if name.trim().is_empty() {
+        let base_name = if name.trim().is_empty() {
             format!("场景{}", self.project_scenes.len() + 1)
         } else {
             name.trim().to_owned()
         };
-        self.project_scenes.push(Scene::empty(&final_name));
-        let scene_count = self.project_scenes.len();
-        if let Some(scene) = self.project_scenes.last_mut() {
-            scene.scene_id = format!("scene_{scene_count:06}");
+        let mut final_name = base_name.clone();
+        let mut suffix = 2;
+        while self
+            .project_scenes
+            .iter()
+            .any(|scene| scene.name == final_name)
+        {
+            final_name = format!("{base_name} ({suffix})");
+            suffix += 1;
         }
+        self.project_scenes.push(Scene::empty(&final_name));
         let index = self.project_scenes.len() - 1;
         self.switch_scene(index);
     }
@@ -797,7 +811,9 @@ impl AppState {
         let mut number = 1_u64;
         loop {
             let id = format!("scene_{number:06}");
-            if !self.project_scenes.iter().any(|scene| scene.scene_id == id) { return id; }
+            if !self.project_scenes.iter().any(|scene| scene.scene_id == id) {
+                return id;
+            }
             number += 1;
         }
     }
@@ -809,7 +825,7 @@ impl Scene {
         Self {
             slide2d_engine: scene_format(),
             name: name.to_owned(),
-            scene_id: String::new(),
+            scene_id: new_scene_id(),
             category: default_scene_category(),
             editor_camera: SceneCameraState::new(),
             camera_snapshots: Vec::new(),
@@ -818,6 +834,17 @@ impl Scene {
             ui_elements: Vec::new(),
         }
     }
+}
+
+/// 生成不依赖场景名称的进程内唯一ID；保存后该值会持续稳定。
+fn new_scene_id() -> String {
+    static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_SCENE_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("scene_{timestamp:032x}_{sequence:016x}")
 }
 
 /// 旧场景文件缺少名称时提供稳定名称。
@@ -898,5 +925,55 @@ mod project_state_tests {
         assert!(state.game_objects.is_empty());
         assert!(state.selected_object_ids.is_empty());
         assert_eq!(state.blueprint_object_id, None);
+    }
+
+    #[test]
+    fn from_scene_restores_editor_camera() {
+        let mut scene = Scene::empty("Camera");
+        scene.editor_camera = SceneCameraState {
+            offset_x: 12.0,
+            offset_y: -34.0,
+            zoom: 1.75,
+        };
+
+        let state = AppState::from_scene(scene);
+
+        assert_eq!(state.view_offset_x, 12.0);
+        assert_eq!(state.view_offset_y, -34.0);
+        assert_eq!(state.view_zoom, 1.75);
+    }
+
+    #[test]
+    fn switching_scene_preserves_editor_state_and_clears_selection() {
+        let mut state = AppState::new();
+        state.add_scene("Second".to_owned());
+        state.switch_scene(0);
+        state.settings_window_open = true;
+        state.editor_settings.show_grid = false;
+        state.blueprint_tab_active = true;
+        state.selected_object_id = Some(999);
+        state.selected_object_ids = vec![999];
+        state.selected_ui_id = Some(999);
+
+        state.switch_scene(1);
+
+        assert!(state.settings_window_open);
+        assert!(!state.editor_settings.show_grid);
+        assert!(state.blueprint_tab_active);
+        assert_eq!(state.selected_object_id, None);
+        assert!(state.selected_object_ids.is_empty());
+        assert_eq!(state.selected_ui_id, None);
+    }
+
+    #[test]
+    fn empty_scene_has_id_and_added_scene_name_is_unique() {
+        let first = Scene::empty("Same");
+        let second = Scene::empty("Same");
+        assert!(!first.scene_id.is_empty());
+        assert_ne!(first.scene_id, second.scene_id);
+
+        let mut state = AppState::new();
+        state.add_scene("场景1".to_owned());
+        assert_eq!(state.active_scene_name(), "场景1 (2)");
     }
 }

@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::app_state::GameObject;
-use crate::blueprint::model::{canonical_key_name, Blueprint, BlueprintNodeKind};
+use crate::blueprint::model::{
+    canonical_key_name, Blueprint, BlueprintDiagnostic, BlueprintNodeKind, Severity,
+};
 use crate::game_ui::UiElement;
-use crate::plugins::{PluginBehavior, PluginNodeCategory};
+use crate::plugins::{
+    PluginAuthorizationMap, PluginBehavior, PluginNodeCategory, PluginRegistry,
+};
 
 /// 保存蓝图虚拟机当前帧需要读取的输入状态。
 pub struct BlueprintInput {
@@ -13,8 +17,8 @@ pub struct BlueprintInput {
     pub clicked_ui_ids: HashSet<u64>,
     pub clicked_object_ids: HashSet<u64>,
     pub scene_just_loaded: bool,
-    /// 当前工程启用的Slide2D声明式插件ID。
-    pub enabled_plugins: HashSet<String>,
+    /// 仅由可信PluginRegistry/manifest构建的插件节点授权。
+    pub plugin_authorizations: PluginAuthorizationMap,
     /// 当前处于Runtime活动视口及扩展边距内的Actor ID。
     pub active_object_ids: HashSet<u64>,
     /// 是否允许纯外部事件蓝图在活动区外休眠。
@@ -33,11 +37,28 @@ impl BlueprintInput {
             clicked_ui_ids: HashSet::new(),
             clicked_object_ids: HashSet::new(),
             scene_just_loaded: true,
-            enabled_plugins: HashSet::new(),
+            plugin_authorizations: HashMap::new(),
             active_object_ids: HashSet::new(),
             dormant_blueprints_enabled: false,
             blueprint_cache_enabled: true,
         }
+    }
+
+    /// 使用已验证注册表替换当前插件授权；空注册表不会授权任何插件节点。
+    pub fn authorize_plugins(&mut self, registry: &PluginRegistry) {
+        self.plugin_authorizations = registry.runtime_authorizations();
+    }
+
+    /// 验证插件、节点类型、manifest行为和Runtime能力四重授权边界。
+    fn plugin_node_is_authorized(
+        &self,
+        plugin_id: &str,
+        node_type: &str,
+        behavior: &PluginBehavior,
+    ) -> bool {
+        self.plugin_authorizations
+            .get(plugin_id)
+            .is_some_and(|authorization| authorization.allows(node_type, behavior))
     }
 
     /// 设置一个物理按键当前是否处于按下状态。
@@ -101,39 +122,72 @@ pub enum RuntimeCommand {
         y: f32,
     },
     DestroyObject(u64),
+    PlaySound {
+        owner_id: u64,
+        path: String,
+        volume: f32,
+    },
+    StopSound {
+        owner_id: u64,
+    },
 }
 
-/// 保存定时器等有状态节点在Runtime中的运行数据。
+/// 单个Actor或UI蓝图实例跨帧保留的数据。
+#[derive(Default)]
+pub struct BlueprintInstanceState {
+    pub variables: HashMap<String, f32>,
+    timers: HashMap<u64, f32>,
+}
+
+/// 保存编译计划、实例变量、定时器和可查询诊断。
 pub struct BlueprintRuntimeState {
-    timer_elapsed: HashMap<(u64, u64), f32>,
-    /// 按对象缓存蓝图JSON签名，避免未变化蓝图重复解析初始化。
-    blueprint_signatures: HashMap<u64, u64>,
-    /// 按蓝图签名缓存事件入口、节点索引和有序后继连线。
-    compiled_blueprints: HashMap<u64, CompiledBlueprint>,
+    instances: HashMap<u64, BlueprintInstanceState>,
+    programs: HashMap<u64, BlueprintProgram>,
+    diagnostics: HashMap<u64, Vec<BlueprintDiagnostic>>,
 }
 
 impl BlueprintRuntimeState {
     /// 创建空蓝图运行状态。
     pub fn new() -> Self {
         Self {
-            timer_elapsed: HashMap::new(),
-            blueprint_signatures: HashMap::new(),
-            compiled_blueprints: HashMap::new(),
+            instances: HashMap::new(),
+            programs: HashMap::new(),
+            diagnostics: HashMap::new(),
         }
+    }
+
+    /// 返回指定owner最近一次编译和执行产生的诊断。
+    pub fn diagnostics(&self, owner_id: u64) -> &[BlueprintDiagnostic] {
+        self.diagnostics
+            .get(&owner_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// 返回指定owner的持久实例变量，UI蓝图也通过此接口读取状态。
+    pub fn variables(&self, owner_id: u64) -> Option<&HashMap<String, f32>> {
+        self.instances.get(&owner_id).map(|state| &state.variables)
+    }
+
+    /// 删除已销毁Actor或UI拥有的全部运行状态和缓存。
+    pub fn remove_owner(&mut self, owner_id: u64) {
+        self.instances.remove(&owner_id);
+        self.programs.remove(&owner_id);
+        self.diagnostics.remove(&owner_id);
     }
 }
 
 /// 蓝图只读执行计划，避免每帧重复扫描节点和连线。
 #[derive(Clone)]
-struct CompiledBlueprint {
+pub struct BlueprintProgram {
     event_node_ids: Vec<u64>,
     node_indices: HashMap<u64, usize>,
     outgoing: HashMap<(u64, u8), Vec<u64>>,
 }
 
-impl CompiledBlueprint {
+impl BlueprintProgram {
     /// 将蓝图节点和连线预解析为快速查找表，并保持原执行顺序。
-    fn compile(blueprint: &Blueprint) -> Self {
+    pub fn compile(blueprint: &Blueprint) -> (Self, Vec<BlueprintDiagnostic>) {
         let event_node_ids = blueprint
             .nodes
             .iter()
@@ -158,11 +212,14 @@ impl CompiledBlueprint {
         for nodes in outgoing.values_mut() {
             nodes.reverse();
         }
-        Self {
-            event_node_ids,
-            node_indices,
-            outgoing,
-        }
+        (
+            Self {
+                event_node_ids,
+                node_indices,
+                outgoing,
+            },
+            blueprint.validate(),
+        )
     }
 
     /// 返回指定端口后继节点的执行栈顺序。
@@ -185,20 +242,22 @@ pub fn update_blueprints_with_state(
     let mut commands = Vec::new();
     for game_object in game_objects {
         let blueprint = std::mem::take(&mut game_object.blueprint);
-        let signature = blueprint_signature(&blueprint);
-        let is_new_program = !input.blueprint_cache_enabled
-            || runtime_state.blueprint_signatures.get(&game_object.id) != Some(&signature);
+        let owner_id = game_object.id;
+        let is_new_program =
+            !input.blueprint_cache_enabled || !runtime_state.programs.contains_key(&owner_id);
         if is_new_program {
-            initialize_variables(game_object, &blueprint.nodes);
+            let (program, diagnostics) = BlueprintProgram::compile(&blueprint);
+            runtime_state.programs.insert(owner_id, program);
+            runtime_state.diagnostics.insert(owner_id, diagnostics);
+            let instance = runtime_state.instances.entry(owner_id).or_default();
+            initialize_variables(&mut instance.variables, &blueprint.nodes, input);
             initialize_global_variables(global_variables, &blueprint.nodes);
-            if input.blueprint_cache_enabled {
-                runtime_state
-                    .blueprint_signatures
-                    .insert(game_object.id, signature);
-                runtime_state
-                    .compiled_blueprints
-                    .insert(signature, CompiledBlueprint::compile(&blueprint));
+        }
+        if let Some(instance) = runtime_state.instances.get_mut(&owner_id) {
+            for (name, value) in &game_object.variables {
+                instance.variables.insert(name.clone(), *value);
             }
+            game_object.variables.clone_from(&instance.variables);
         }
         if should_sleep_blueprint(game_object.id, &blueprint, input) {
             game_object.blueprint = blueprint;
@@ -206,12 +265,12 @@ pub fn update_blueprints_with_state(
         }
         let plan = if input.blueprint_cache_enabled {
             runtime_state
-                .compiled_blueprints
-                .entry(signature)
-                .or_insert_with(|| CompiledBlueprint::compile(&blueprint))
+                .programs
+                .entry(owner_id)
+                .or_insert_with(|| BlueprintProgram::compile(&blueprint).0)
                 .clone()
         } else {
-            CompiledBlueprint::compile(&blueprint)
+            BlueprintProgram::compile(&blueprint).0
         };
         let mut queue = Vec::new();
         for node_id in &plan.event_node_ids {
@@ -238,6 +297,18 @@ pub fn update_blueprints_with_state(
         while let Some(node_id) = queue.pop() {
             executed_steps += 1;
             if executed_steps > 1024 {
+                let diagnostics = runtime_state.diagnostics.entry(owner_id).or_default();
+                if !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "execution_limit_exceeded")
+                {
+                    diagnostics.push(BlueprintDiagnostic::new(
+                        Severity::Error,
+                        "execution_limit_exceeded",
+                        "单帧蓝图执行超过1024步，执行已中止",
+                        Some(node_id),
+                    ));
+                }
                 break;
             }
             let action_node = match plan
@@ -252,12 +323,13 @@ pub fn update_blueprints_with_state(
             match &action_node.kind {
                 BlueprintNodeKind::PluginNode {
                     plugin_id,
+                    node_type,
                     behavior,
                     variable_name,
                     value,
                     ..
                 } => {
-                    if !input.enabled_plugins.contains(plugin_id) {
+                    if !input.plugin_node_is_authorized(plugin_id, node_type, behavior) {
                         continue;
                     }
                     match behavior {
@@ -296,6 +368,18 @@ pub fn update_blueprints_with_state(
                     if !name.trim().is_empty() {
                         game_object.variables.insert(name.clone(), *value);
                     }
+                }
+                BlueprintNodeKind::PlaySound { path, volume } => {
+                    if !path.trim().is_empty() {
+                        commands.push(RuntimeCommand::PlaySound {
+                            owner_id,
+                            path: path.clone(),
+                            volume: *volume,
+                        });
+                    }
+                }
+                BlueprintNodeKind::StopSound => {
+                    commands.push(RuntimeCommand::StopSound { owner_id });
                 }
                 BlueprintNodeKind::SwitchAnimation { animation_path } => {
                     if !animation_path.trim().is_empty()
@@ -411,20 +495,15 @@ pub fn update_blueprints_with_state(
             }
             queue.extend(plan.outgoing_nodes(node_id, output_port));
         }
+        runtime_state
+            .instances
+            .entry(owner_id)
+            .or_default()
+            .variables
+            .clone_from(&game_object.variables);
         game_object.blueprint = blueprint;
     }
     commands
-}
-
-/// 根据蓝图序列化内容生成稳定的FNV-1a签名，用于执行计划失效检测。
-fn blueprint_signature(blueprint: &Blueprint) -> u64 {
-    let bytes = serde_json::to_vec(blueprint).unwrap_or_default();
-    let mut value = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        value ^= byte as u64;
-        value = value.wrapping_mul(0x100000001b3);
-    }
-    value
 }
 
 /// 仅让纯点击或碰撞事件蓝图在视口外休眠，保留所有持续逻辑语义。
@@ -533,7 +612,7 @@ pub fn update_ui_blueprints_with_state(
     let mut commands = Vec::new();
     for element in elements {
         let mut virtual_object = GameObject {
-            id: u64::MAX - element.id,
+            id: ui_blueprint_owner_id(element.id),
             x: element.x,
             y: element.y,
             width: element.width,
@@ -560,6 +639,11 @@ pub fn update_ui_blueprints_with_state(
     commands
 }
 
+/// 将场景UI ID映射到与Actor ID隔离的蓝图owner ID。
+pub fn ui_blueprint_owner_id(ui_id: u64) -> u64 {
+    u64::MAX - ui_id
+}
+
 /// 判断事件节点在当前帧是否被触发。
 fn event_is_active_with_state(
     kind: &BlueprintNodeKind,
@@ -582,8 +666,11 @@ fn event_is_active_with_state(
         } => {
             let delay = delay_seconds.max(0.001);
             let elapsed = runtime_state
-                .timer_elapsed
-                .entry((object_id, node_id))
+                .instances
+                .entry(object_id)
+                .or_default()
+                .timers
+                .entry(node_id)
                 .or_insert(0.0);
             *elapsed += delta_time;
             if *elapsed >= delay {
@@ -599,11 +686,13 @@ fn event_is_active_with_state(
         }
         BlueprintNodeKind::PluginNode {
             plugin_id,
+            node_type,
             category,
             behavior,
             ..
         } => {
-            if !input.enabled_plugins.contains(plugin_id) || *category != PluginNodeCategory::Event
+            if !input.plugin_node_is_authorized(plugin_id, node_type, behavior)
+                || *category != PluginNodeCategory::Event
             {
                 return false;
             }
@@ -626,8 +715,9 @@ fn event_is_active(kind: &BlueprintNodeKind, input: &BlueprintInput, object_id: 
 
 /// 根据变量节点声明，为当前物体创建尚不存在的初始变量。
 fn initialize_variables(
-    game_object: &mut GameObject,
+    variables: &mut HashMap<String, f32>,
     nodes: &[crate::blueprint::model::BlueprintNode],
+    input: &BlueprintInput,
 ) {
     for node in nodes {
         if let BlueprintNodeKind::NumberVariable {
@@ -636,24 +726,25 @@ fn initialize_variables(
         } = &node.kind
         {
             if !name.trim().is_empty() {
-                game_object
-                    .variables
-                    .entry(name.clone())
-                    .or_insert(*initial_value);
+                variables.entry(name.clone()).or_insert(*initial_value);
             }
         }
         if let BlueprintNodeKind::PluginNode {
+            plugin_id,
+            node_type,
             behavior: PluginBehavior::NumberVariable,
             variable_name,
             value,
             ..
         } = &node.kind
         {
-            if !variable_name.trim().is_empty() {
-                game_object
-                    .variables
-                    .entry(variable_name.clone())
-                    .or_insert(*value);
+            if input.plugin_node_is_authorized(
+                plugin_id,
+                node_type,
+                &PluginBehavior::NumberVariable,
+            ) && !variable_name.trim().is_empty()
+            {
+                variables.entry(variable_name.clone()).or_insert(*value);
             }
         }
     }
@@ -683,6 +774,7 @@ mod tests {
     use crate::blueprint::model::{
         Blueprint, BlueprintConnection, BlueprintNode, BlueprintNodeKind,
     };
+    use crate::game_ui::{UiElement, UiElementKind};
 
     /// 创建供插件和高级蓝图测试使用的简单游戏物体。
     fn test_object_with_blueprint(blueprint: Blueprint) -> GameObject {
@@ -701,6 +793,7 @@ mod tests {
             blueprint,
             blueprint_file: "blueprint_1.json".to_owned(),
             variables: HashMap::new(),
+            persistent: false,
         }
     }
 
@@ -750,6 +843,7 @@ mod tests {
             blueprint,
             blueprint_file: "blueprint_1.json".to_owned(),
             variables: std::collections::HashMap::new(),
+            persistent: false,
         }];
 
         let mut input = BlueprintInput::new();
@@ -834,6 +928,7 @@ mod tests {
             blueprint,
             blueprint_file: "blueprint_1.json".to_owned(),
             variables: std::collections::HashMap::new(),
+            persistent: false,
         };
 
         update_blueprints(
@@ -889,6 +984,7 @@ mod tests {
             blueprint,
             blueprint_file: String::new(),
             variables: HashMap::new(),
+            persistent: false,
         };
         let mut input = BlueprintInput::new();
         input.clicked_ui_ids.insert(7);
@@ -938,6 +1034,7 @@ mod tests {
             blueprint,
             blueprint_file: String::new(),
             variables: HashMap::new(),
+            persistent: false,
         };
         let mut globals = HashMap::from([("score".to_owned(), 20.0)]);
         let mut runtime_state = BlueprintRuntimeState::new();
@@ -976,9 +1073,9 @@ mod tests {
         let mut object = test_object_with_blueprint(blueprint);
         let mut input = BlueprintInput::new();
         input.clicked_object_ids.insert(object.id);
-        input
-            .enabled_plugins
-            .insert(crate::plugins::OFFICIAL_PICKUP_PLUGIN_ID.to_owned());
+        let root = unique_plugin_test_directory("pickup_authorized");
+        let registry = PluginRegistry::load_new_project(root.clone());
+        input.authorize_plugins(&registry);
         let mut globals = HashMap::new();
         let mut state = BlueprintRuntimeState::new();
         update_blueprints_with_state(
@@ -990,6 +1087,74 @@ mod tests {
         );
         assert_eq!(object.variables.get("picked"), Some(&1.0));
         assert_eq!(object.variables.get("success"), Some(&1.0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 蓝图不能把manifest中的拾取行为伪造成更高权限的全局变量写入行为。
+    #[test]
+    fn forged_plugin_behavior_is_rejected() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_frame_updated_node();
+        blueprint.add_kind(BlueprintNodeKind::PluginNode {
+            plugin_id: crate::plugins::OFFICIAL_PICKUP_PLUGIN_ID.to_owned(),
+            node_type: "pickup_check".to_owned(),
+            display_name: "伪造节点".to_owned(),
+            description: "测试".to_owned(),
+            category: PluginNodeCategory::Action,
+            behavior: PluginBehavior::SetGlobalVariable,
+            variable_name: "forged".to_owned(),
+            value: 99.0,
+        });
+        blueprint.connect(1, 2);
+        let mut object = test_object_with_blueprint(blueprint);
+        let root = unique_plugin_test_directory("forged_behavior");
+        let registry = PluginRegistry::load_new_project(root.clone());
+        let mut input = BlueprintInput::new();
+        input.authorize_plugins(&registry);
+        let mut globals = HashMap::new();
+        let mut state = BlueprintRuntimeState::new();
+
+        update_blueprints_with_state(
+            std::slice::from_mut(&mut object),
+            &input,
+            0.016,
+            &mut globals,
+            &mut state,
+        );
+
+        assert!(!globals.contains_key("forged"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 插件事件同样必须匹配manifest，不能仅依赖蓝图内嵌behavior触发。
+    #[test]
+    fn forged_plugin_event_behavior_is_rejected() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_kind(BlueprintNodeKind::PluginNode {
+            plugin_id: crate::plugins::OFFICIAL_PICKUP_PLUGIN_ID.to_owned(),
+            node_type: "pickup_check".to_owned(),
+            display_name: "伪造事件".to_owned(),
+            description: "测试".to_owned(),
+            category: PluginNodeCategory::Event,
+            behavior: PluginBehavior::SceneLoadedEvent,
+            variable_name: String::new(),
+            value: 0.0,
+        });
+        blueprint.add_kind(BlueprintNodeKind::SetVariable {
+            name: "triggered".to_owned(),
+            value: 1.0,
+        });
+        blueprint.connect(1, 2);
+        let mut object = test_object_with_blueprint(blueprint);
+        let root = unique_plugin_test_directory("forged_event");
+        let registry = PluginRegistry::load_new_project(root.clone());
+        let mut input = BlueprintInput::new();
+        input.authorize_plugins(&registry);
+
+        update_blueprints(std::slice::from_mut(&mut object), &input, 0.016);
+
+        assert!(!object.variables.contains_key("triggered"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// 验证包含帧更新事件的物体即使在视口外也不会被错误休眠。
@@ -1015,5 +1180,136 @@ mod tests {
             &mut state,
         );
         assert_eq!(object.variables.get("ran"), Some(&1.0));
+    }
+
+    #[test]
+    fn audio_nodes_emit_owner_scoped_commands() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_frame_updated_node();
+        blueprint.add_kind(BlueprintNodeKind::PlaySound {
+            path: "audio/jump.wav".to_owned(),
+            volume: 0.5,
+        });
+        blueprint.add_kind(BlueprintNodeKind::StopSound);
+        blueprint.connect(1, 2);
+        blueprint.connect(2, 3);
+        let mut object = test_object_with_blueprint(blueprint);
+        let mut globals = HashMap::new();
+        let mut state = BlueprintRuntimeState::new();
+
+        let commands = update_blueprints_with_state(
+            std::slice::from_mut(&mut object),
+            &BlueprintInput::new(),
+            0.016,
+            &mut globals,
+            &mut state,
+        );
+
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::PlaySound { owner_id: 1, path, volume }
+                if path == "audio/jump.wav" && *volume == 0.5
+        )));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::StopSound { owner_id: 1 })));
+    }
+
+    #[test]
+    fn ui_blueprint_variables_persist_between_frames() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_kind(BlueprintNodeKind::ButtonClicked { ui_id: 7 });
+        blueprint.add_kind(BlueprintNodeKind::SetVariable {
+            name: "clicks".to_owned(),
+            value: 1.0,
+        });
+        blueprint.add_kind(BlueprintNodeKind::NumberVariable {
+            name: "clicks".to_owned(),
+            initial_value: 0.0,
+        });
+        blueprint.connect(1, 2);
+        let element = UiElement {
+            id: 7,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 30.0,
+            layer_index: 0,
+            visible: true,
+            kind: UiElementKind::Button {
+                text: "test".to_owned(),
+            },
+            blueprint,
+            persistent: false,
+        };
+        let mut input = BlueprintInput::new();
+        input.clicked_ui_ids.insert(7);
+        let mut globals = HashMap::new();
+        let mut state = BlueprintRuntimeState::new();
+        update_ui_blueprints_with_state(
+            std::slice::from_ref(&element),
+            &input,
+            0.016,
+            &mut globals,
+            &mut state,
+        );
+        input.clicked_ui_ids.clear();
+        update_ui_blueprints_with_state(
+            std::slice::from_ref(&element),
+            &input,
+            0.016,
+            &mut globals,
+            &mut state,
+        );
+
+        assert_eq!(
+            state
+                .variables(ui_blueprint_owner_id(element.id))
+                .and_then(|variables| variables.get("clicks")),
+            Some(&1.0)
+        );
+    }
+
+    #[test]
+    fn execution_limit_is_queryable_as_diagnostic() {
+        let mut blueprint = Blueprint::new();
+        blueprint.add_frame_updated_node();
+        blueprint.add_kind(BlueprintNodeKind::ModifyPosition {
+            delta_x: 0.0,
+            delta_y: 0.0,
+        });
+        blueprint.add_kind(BlueprintNodeKind::ModifyPosition {
+            delta_x: 0.0,
+            delta_y: 0.0,
+        });
+        blueprint.connect(1, 2);
+        blueprint.connect(2, 3);
+        blueprint.connect(3, 2);
+        let mut object = test_object_with_blueprint(blueprint);
+        let mut globals = HashMap::new();
+        let mut state = BlueprintRuntimeState::new();
+        update_blueprints_with_state(
+            std::slice::from_mut(&mut object),
+            &BlueprintInput::new(),
+            0.016,
+            &mut globals,
+            &mut state,
+        );
+
+        assert!(state
+            .diagnostics(object.id)
+            .iter()
+            .any(|diagnostic| diagnostic.code == "execution_limit_exceeded"));
+    }
+
+    fn unique_plugin_test_directory(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "slide2d_vm_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
     }
 }

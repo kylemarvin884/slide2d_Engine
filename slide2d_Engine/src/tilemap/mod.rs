@@ -2,7 +2,8 @@
 
 use crate::localization::tr;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// 一个图集切分后的单类瓦片属性。
@@ -117,11 +118,30 @@ pub struct TileCell {
 }
 
 /// 一层稀疏瓦片数据，只保存真正绘制过的格子。
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TileLayer {
     pub kind: TileLayerKind,
     pub visible: bool,
     pub cells: Vec<TileCell>,
+    #[serde(skip)]
+    cell_index: RefCell<Option<TileCellIndex>>,
+}
+
+/// 不参与序列化的坐标索引；记录长度用于发现外部对公开cells的clear等修改。
+struct TileCellIndex {
+    positions: HashMap<(i32, i32), usize>,
+    cells_len: usize,
+}
+
+impl Clone for TileLayer {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            visible: self.visible,
+            cells: self.cells.clone(),
+            cell_index: RefCell::new(None),
+        }
+    }
 }
 
 impl TileLayer {
@@ -131,33 +151,101 @@ impl TileLayer {
             kind,
             visible: true,
             cells: Vec::new(),
+            cell_index: RefCell::new(None),
         }
     }
 
     /// 查询指定格子的瓦片ID。
     pub fn tile_at(&self, x: i32, y: i32) -> Option<u32> {
-        self.cells
-            .iter()
-            .find(|cell| cell.x == x && cell.y == y)
-            .map(|cell| cell.tile_id)
+        self.ensure_cell_index();
+        let index = self
+            .cell_index
+            .borrow()
+            .as_ref()
+            .and_then(|index| index.positions.get(&(x, y)).copied());
+        index.and_then(|index| self.cells.get(index).map(|cell| cell.tile_id))
     }
 
     /// 绘制或覆盖一个瓦片。
     pub fn set_tile(&mut self, x: i32, y: i32, tile_id: u32) {
-        if let Some(cell) = self
-            .cells
-            .iter_mut()
-            .find(|cell| cell.x == x && cell.y == y)
-        {
-            cell.tile_id = tile_id;
+        self.ensure_cell_index();
+        let existing = self
+            .cell_index
+            .borrow()
+            .as_ref()
+            .and_then(|index| index.positions.get(&(x, y)).copied());
+        if let Some(index) = existing {
+            self.cells[index].tile_id = tile_id;
         } else {
+            let index = self.cells.len();
             self.cells.push(TileCell { x, y, tile_id });
+            if let Some(cell_index) = self.cell_index.get_mut() {
+                cell_index.positions.insert((x, y), index);
+                cell_index.cells_len = self.cells.len();
+            }
         }
     }
 
     /// 删除指定格子的瓦片。
     pub fn erase_tile(&mut self, x: i32, y: i32) {
-        self.cells.retain(|cell| cell.x != x || cell.y != y);
+        self.ensure_cell_index();
+        let removed = self
+            .cell_index
+            .get_mut()
+            .as_mut()
+            .and_then(|index| index.positions.remove(&(x, y)));
+        if let Some(removed) = removed {
+            self.cells.swap_remove(removed);
+            if removed < self.cells.len() {
+                let moved = &self.cells[removed];
+                if let Some(index) = self.cell_index.get_mut() {
+                    index.positions.insert((moved.x, moved.y), removed);
+                }
+            }
+            if let Some(index) = self.cell_index.get_mut() {
+                index.cells_len = self.cells.len();
+            }
+        }
+    }
+
+    /// 使用同一瓦片替换闭区间矩形，复杂度为O(现有格子数+矩形面积)。
+    pub fn replace_rect(
+        &mut self,
+        minimum_x: i32,
+        minimum_y: i32,
+        maximum_x: i32,
+        maximum_y: i32,
+        tile_id: u32,
+    ) {
+        if minimum_x > maximum_x || minimum_y > maximum_y {
+            return;
+        }
+        self.ensure_cell_index();
+        for y in minimum_y..=maximum_y {
+            for x in minimum_x..=maximum_x {
+                self.set_tile(x, y, tile_id);
+            }
+        }
+    }
+
+    /// 丢弃当前层内容并使用同一瓦片填满从(0, 0)开始的有限范围。
+    pub fn fill_entire(&mut self, width: u32, height: u32, tile_id: u32) {
+        let width = width.min(i32::MAX as u32);
+        let height = height.min(i32::MAX as u32);
+        let cell_count = (width as usize).checked_mul(height as usize).unwrap_or(0);
+        let mut cells = Vec::with_capacity(cell_count);
+        let mut positions = HashMap::with_capacity(cell_count);
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                positions.insert((x, y), cells.len());
+                cells.push(TileCell { x, y, tile_id });
+            }
+        }
+        self.cells = cells;
+        *self.cell_index.get_mut() = Some(TileCellIndex {
+            positions,
+            cells_len: cell_count,
+        });
     }
 
     /// 从起点进行四方向洪水填充，最多处理10000格防止误操作无限扩张。
@@ -167,21 +255,49 @@ impl TileLayer {
             return;
         }
         let mut queue = VecDeque::from([(start_x, start_y)]);
-        let mut visited = HashMap::new();
+        let mut visited = HashSet::new();
         while let Some((x, y)) = queue.pop_front() {
-            if visited.len() >= 10_000 || visited.contains_key(&(x, y)) {
+            if visited.len() >= 10_000 || !visited.insert((x, y)) {
                 continue;
             }
-            visited.insert((x, y), true);
             if self.tile_at(x, y) != old_tile {
                 continue;
             }
             self.set_tile(x, y, tile_id);
-            queue.push_back((x + 1, y));
-            queue.push_back((x - 1, y));
-            queue.push_back((x, y + 1));
-            queue.push_back((x, y - 1));
+            if let Some(next_x) = x.checked_add(1) {
+                queue.push_back((next_x, y));
+            }
+            if let Some(next_x) = x.checked_sub(1) {
+                queue.push_back((next_x, y));
+            }
+            if let Some(next_y) = y.checked_add(1) {
+                queue.push_back((x, next_y));
+            }
+            if let Some(next_y) = y.checked_sub(1) {
+                queue.push_back((x, next_y));
+            }
         }
+    }
+
+    /// 首次查询、反序列化、Clone或外部清空cells后按需重建坐标索引。
+    fn ensure_cell_index(&self) {
+        let needs_rebuild = self
+            .cell_index
+            .borrow()
+            .as_ref()
+            .map(|index| index.cells_len != self.cells.len())
+            .unwrap_or(true);
+        if !needs_rebuild {
+            return;
+        }
+        let mut positions = HashMap::with_capacity(self.cells.len());
+        for (index, cell) in self.cells.iter().enumerate() {
+            positions.entry((cell.x, cell.y)).or_insert(index);
+        }
+        *self.cell_index.borrow_mut() = Some(TileCellIndex {
+            positions,
+            cells_len: self.cells.len(),
+        });
     }
 }
 
@@ -325,5 +441,55 @@ mod tests {
             Some(2)
         );
         assert!(restored.tileset.unwrap().property(2).unwrap().collision);
+    }
+
+    /// 验证大矩形批量替换保持唯一格子和查询索引一致。
+    #[test]
+    fn large_rect_replace_keeps_cells_and_index_consistent() {
+        let mut layer = TileLayer::new(TileLayerKind::Ground);
+        layer.fill_entire(400, 300, 1);
+        layer.replace_rect(100, 50, 299, 249, 7);
+
+        assert_eq!(layer.cells.len(), 120_000);
+        assert_eq!(layer.tile_at(99, 50), Some(1));
+        assert_eq!(layer.tile_at(100, 50), Some(7));
+        assert_eq!(layer.tile_at(299, 249), Some(7));
+        assert_eq!(layer.tile_at(300, 249), Some(1));
+        let unique: HashSet<_> = layer.cells.iter().map(|cell| (cell.x, cell.y)).collect();
+        assert_eq!(unique.len(), layer.cells.len());
+    }
+
+    /// 验证Clone和反序列化后会惰性恢复索引，且JSON仍只有原有字段。
+    #[test]
+    fn cloned_and_deserialized_layers_rebuild_runtime_index() {
+        let mut layer = TileLayer::new(TileLayerKind::Decoration);
+        layer.fill_entire(128, 128, 3);
+        let mut cloned = layer.clone();
+        cloned.set_tile(127, 127, 9);
+        assert_eq!(cloned.tile_at(127, 127), Some(9));
+        assert_eq!(layer.tile_at(127, 127), Some(3));
+
+        let json = serde_json::to_value(&layer).unwrap();
+        assert!(json.get("cell_index").is_none());
+        assert!(json.get("cells").unwrap().is_array());
+        let mut restored: TileLayer = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.tile_at(64, 64), Some(3));
+        restored.erase_tile(64, 64);
+        assert_eq!(restored.tile_at(64, 64), None);
+        assert_eq!(restored.cells.len(), 128 * 128 - 1);
+    }
+
+    /// 验证洪水填充只替换连通区域并保持索引与存储一致。
+    #[test]
+    fn large_flood_fill_is_consistent() {
+        let mut layer = TileLayer::new(TileLayerKind::Ground);
+        layer.fill_entire(100, 100, 2);
+        layer.replace_rect(50, 0, 50, 99, 8);
+        layer.fill(0, 0, 5);
+
+        assert_eq!(layer.tile_at(49, 99), Some(5));
+        assert_eq!(layer.tile_at(50, 99), Some(8));
+        assert_eq!(layer.tile_at(51, 99), Some(2));
+        assert_eq!(layer.cells.iter().filter(|cell| cell.tile_id == 5).count(), 5_000);
     }
 }

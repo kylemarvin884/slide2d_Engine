@@ -5,13 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::ScreenDescriptor;
 use rapier2d::prelude::*;
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use wgpu::util::DeviceExt;
 use winit::dpi::LogicalSize;
 use winit::event::ElementState;
@@ -24,10 +25,11 @@ use crate::animation::{resolve_asset_path, SpriteAnimation};
 use crate::app_state::{GameObject, PerformanceSettings, RuntimePerformanceReport, Scene};
 use crate::blueprint::model::BlueprintNodeKind;
 use crate::blueprint::vm::{
-    update_blueprints_with_state, update_ui_blueprints_with_state, BlueprintInput,
-    BlueprintRuntimeState, RuntimeCommand, UiCommand,
+    ui_blueprint_owner_id, update_blueprints_with_state, update_ui_blueprints_with_state,
+    BlueprintInput, BlueprintRuntimeState, RuntimeCommand, UiCommand,
 };
 use crate::game_ui::{UiElement, UiElementKind};
+use crate::plugins::{PluginAuthorizationMap, PluginRegistry};
 use crate::project::{open_project, Slide2dProject, PROJECT_MAGIC};
 use crate::tilemap::{TileLayerKind, TileMap, TileSet};
 
@@ -100,6 +102,129 @@ struct PreparedUiFrame {
     textures_delta: egui::TexturesDelta,
 }
 
+/// 长期持有音频输出设备，并按蓝图owner管理仍可停止的播放器。
+struct AudioEngine {
+    _stream: Option<OutputStream>,
+    handle: Option<OutputStreamHandle>,
+    sinks: HashMap<u64, Vec<Sink>>,
+}
+
+impl AudioEngine {
+    fn new() -> Self {
+        match OutputStream::try_default() {
+            Ok((stream, handle)) => Self {
+                _stream: Some(stream),
+                handle: Some(handle),
+                sinks: HashMap::new(),
+            },
+            Err(error) => {
+                eprintln!("无法打开默认音频设备：{error}");
+                Self {
+                    _stream: None,
+                    handle: None,
+                    sinks: HashMap::new(),
+                }
+            }
+        }
+    }
+
+    fn play(&mut self, owner_id: u64, path: &std::path::Path, volume: f32) {
+        let Some(handle) = &self.handle else { return };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("打开音效失败：{}，错误：{error}", path.display());
+                return;
+            }
+        };
+        let decoder = match Decoder::new(std::io::BufReader::new(file)) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                eprintln!("解码音效失败：{}，错误：{error}", path.display());
+                return;
+            }
+        };
+        let sink = match Sink::try_new(handle) {
+            Ok(sink) => sink,
+            Err(error) => {
+                eprintln!("创建音效播放器失败：{error}");
+                return;
+            }
+        };
+        sink.set_volume(volume.max(0.0));
+        sink.append(decoder);
+        let owner_sinks = self.sinks.entry(owner_id).or_default();
+        owner_sinks.retain(|sink| !sink.empty());
+        owner_sinks.push(sink);
+    }
+
+    fn stop_owner(&mut self, owner_id: u64) {
+        if let Some(sinks) = self.sinks.remove(&owner_id) {
+            for sink in sinks {
+                sink.stop();
+            }
+        }
+    }
+
+    fn retain_owners(&mut self, owner_ids: &HashSet<u64>) {
+        let removed: Vec<u64> = self
+            .sinks
+            .keys()
+            .filter(|owner_id| !owner_ids.contains(owner_id))
+            .copied()
+            .collect();
+        for owner_id in removed {
+            self.stop_owner(owner_id);
+        }
+    }
+
+    fn play_scene_audio(&mut self, objects: &[GameObject], directory: &std::path::Path) {
+        for object in objects {
+            if !object.audio_path.is_empty() {
+                self.play(
+                    object.id,
+                    &resolve_runtime_asset_path(directory, &object.audio_path),
+                    1.0,
+                );
+            }
+        }
+    }
+}
+
+/// Runtime实体ID只递增；销毁对象或切换到较小ID场景都不会回退。
+struct RuntimeEntityIds {
+    next: u64,
+}
+
+impl RuntimeEntityIds {
+    fn from_objects(objects: &[GameObject]) -> Self {
+        Self {
+            next: objects
+                .iter()
+                .map(|object| object.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        }
+    }
+
+    fn observe(&mut self, objects: &[GameObject]) {
+        let scene_next = objects
+            .iter()
+            .map(|object| object.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next = self.next.max(scene_next);
+    }
+
+    fn allocate(&mut self) -> u64 {
+        let id = self.next;
+        self.next = self.next.saturating_add(1);
+        id
+    }
+}
+
 /// 保存Rapier物理世界及游戏物体到刚体的对应关系。
 struct PhysicsWorld {
     pipeline: PhysicsPipeline,
@@ -115,6 +240,7 @@ struct PhysicsWorld {
     ccd_solver: CCDSolver,
     object_bodies: HashMap<u64, RigidBodyHandle>,
     collider_objects: HashMap<ColliderHandle, u64>,
+    previous_contacts: HashSet<(ColliderHandle, ColliderHandle)>,
     accumulated_time: f32,
 }
 
@@ -138,6 +264,7 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             object_bodies: HashMap::new(),
             collider_objects: HashMap::new(),
+            previous_contacts: HashSet::new(),
             accumulated_time: 0.0,
         };
 
@@ -266,6 +393,7 @@ impl PhysicsWorld {
             settings,
         );
         self.accumulated_time += elapsed_seconds.min(0.1);
+        let mut collision_objects = HashSet::new();
         while self.accumulated_time >= FIXED_TIME_STEP {
             self.pipeline.step(
                 &self.gravity,
@@ -283,6 +411,22 @@ impl PhysicsWorld {
                 &(),
             );
             self.accumulated_time -= FIXED_TIME_STEP;
+            let mut current_contacts = HashSet::new();
+            for contact_pair in self.narrow_phase.contact_pairs() {
+                if contact_pair.has_any_active_contact {
+                    current_contacts.insert((contact_pair.collider1, contact_pair.collider2));
+                }
+            }
+            for (collider1, collider2) in
+                take_started_contacts(&mut self.previous_contacts, current_contacts)
+            {
+                if let Some(object_id) = self.collider_objects.get(&collider1) {
+                    collision_objects.insert(*object_id);
+                }
+                if let Some(object_id) = self.collider_objects.get(&collider2) {
+                    collision_objects.insert(*object_id);
+                }
+            }
         }
 
         for game_object in game_objects {
@@ -298,18 +442,6 @@ impl PhysicsWorld {
             game_object.y = rigid_body.translation().y - game_object.height * 0.5;
         }
 
-        let mut collision_objects = HashSet::new();
-        for contact_pair in self.narrow_phase.contact_pairs() {
-            if !contact_pair.has_any_active_contact {
-                continue;
-            }
-            if let Some(object_id) = self.collider_objects.get(&contact_pair.collider1) {
-                collision_objects.insert(*object_id);
-            }
-            if let Some(object_id) = self.collider_objects.get(&contact_pair.collider2) {
-                collision_objects.insert(*object_id);
-            }
-        }
         collision_objects
     }
 
@@ -392,12 +524,13 @@ pub fn run(scene_path: &str) -> Result<(), String> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
+    let plugin_registry = PluginRegistry::load_adjacent(scene_directory.clone());
     run_window(
         scene,
         scene_directory,
         None,
         HashMap::new(),
-        HashSet::new(),
+        plugin_registry.runtime_authorizations(),
         PerformanceSettings::new(),
     )
 }
@@ -441,19 +574,15 @@ fn run_project(project_path: &str) -> Result<(), String> {
         .or_else(|| project.scenes.first().cloned())
         .ok_or_else(|| "工程中没有场景".to_owned())?;
     let state = open_project(std::path::Path::new(project_path))?;
-    let global_variables = arguments
-        .windows(2)
-        .find(|values| values[0] == "--globals")
-        .and_then(|values| serde_json::from_str(&values[1]).ok())
-        .unwrap_or(project.global_variables);
-    let enabled_plugins = project.enabled_plugins.clone();
+    let global_variables = project.global_variables.clone();
+    let plugin_authorizations = state.plugin_registry.runtime_authorizations();
     let performance_settings = project.performance_settings.clone();
     run_window(
         scene,
         state.project_root,
-        Some(project_path.to_owned()),
+        Some(project),
         global_variables,
-        enabled_plugins,
+        plugin_authorizations,
         performance_settings,
     )
 }
@@ -462,9 +591,9 @@ fn run_project(project_path: &str) -> Result<(), String> {
 fn run_window(
     mut scene: Scene,
     scene_directory: std::path::PathBuf,
-    project_path: Option<String>,
+    project: Option<Slide2dProject>,
     initial_global_variables: HashMap<String, f32>,
-    enabled_plugins: HashSet<String>,
+    plugin_authorizations: PluginAuthorizationMap,
     performance_settings: PerformanceSettings,
 ) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
@@ -598,7 +727,7 @@ fn run_window(
         &scene.game_objects,
         &scene_directory,
     );
-    let runtime_tileset = load_runtime_tileset(
+    let mut runtime_tileset = load_runtime_tileset(
         &device,
         &queue,
         &texture_bind_group_layout,
@@ -610,10 +739,18 @@ fn run_window(
         &scene.tile_map,
         runtime_tileset.as_ref(),
         &surface_config,
+        window.scale_factor() as f32,
         &performance_settings,
     );
-    // OutputStream必须在整个事件循环期间保持存活，否则音效会立即停止。
-    let _audio_stream = play_scene_audio(&scene.game_objects, &scene_directory);
+    let mut audio_engine = AudioEngine::new();
+    audio_engine.play_scene_audio(&scene.game_objects, &scene_directory);
+    let mut object_prototypes: HashMap<u64, GameObject> = scene
+        .game_objects
+        .iter()
+        .cloned()
+        .map(|object| (object.id, object))
+        .collect();
+    let mut runtime_entity_ids = RuntimeEntityIds::from_objects(&scene.game_objects);
     let mut physics_world = PhysicsWorld::new(&scene.game_objects);
     if let Some(runtime_tileset) = &runtime_tileset {
         physics_world.add_tile_colliders(
@@ -624,7 +761,7 @@ fn run_window(
     }
     let mut previous_time = Instant::now();
     let mut blueprint_input = BlueprintInput::new();
-    blueprint_input.enabled_plugins = enabled_plugins;
+    blueprint_input.plugin_authorizations = plugin_authorizations;
     blueprint_input.dormant_blueprints_enabled = performance_settings.dormant_blueprints;
     blueprint_input.blueprint_cache_enabled = performance_settings.blueprint_cache;
     let mut global_variables = initial_global_variables;
@@ -654,6 +791,7 @@ fn run_window(
                                     &scene.tile_map,
                                     runtime_tileset.as_ref(),
                                     &surface_config,
+                                    window.scale_factor() as f32,
                                     &performance_settings,
                                 );
                             }
@@ -676,12 +814,14 @@ fn run_window(
                             button: winit::event::MouseButton::Left,
                             ..
                         } => {
-                            let clicked = find_clicked_objects(
-                                &scene.game_objects,
-                                last_cursor_position.0,
-                                last_cursor_position.1,
-                            );
-                            blueprint_input.set_clicked_object_ids(clicked);
+                            if !egui_response.consumed {
+                                let clicked = find_clicked_objects(
+                                    &scene.game_objects,
+                                    last_cursor_position.0,
+                                    last_cursor_position.1,
+                                );
+                                blueprint_input.set_clicked_object_ids(clicked);
+                            }
                         }
                         WindowEvent::Focused(false) => {
                             blueprint_input.clear();
@@ -703,10 +843,16 @@ fn run_window(
                                 &performance_settings,
                             );
                             blueprint_input.set_clicked_ui_ids(clicked_ui_ids);
+                            let scale_factor = window.scale_factor() as f32;
+                            let (logical_width, logical_height) = logical_viewport(
+                                surface_config.width,
+                                surface_config.height,
+                                scale_factor,
+                            );
                             blueprint_input.active_object_ids = active_runtime_object_ids(
                                 &scene.game_objects,
-                                surface_config.width as f32,
-                                surface_config.height as f32,
+                                logical_width,
+                                logical_height,
                                 performance_settings.activity_margin,
                             );
                             let positions_before_blueprints: HashMap<u64, (f32, f32)> = scene
@@ -735,37 +881,120 @@ fn run_window(
                             ));
                             let blueprint_time_ms =
                                 blueprint_started.elapsed().as_secs_f32() * 1000.0;
-                            let mut switch_scene_name = None;
-                            let mut spawn_commands = Vec::new();
-                            let mut destroy_ids = Vec::new();
-                            let all_ui_commands: Vec<UiCommand> = runtime_commands
-                                .into_iter()
-                                .filter_map(|command| match command {
-                                    RuntimeCommand::Ui(command) => Some(command),
-                                    RuntimeCommand::SwitchScene(name) => {
-                                        switch_scene_name = Some(name);
-                                        None
+                            let mut objects_changed = false;
+                            let mut scene_changed = false;
+                            submit_runtime_commands(runtime_commands, |command| match command {
+                                RuntimeCommand::Ui(command) => {
+                                    apply_ui_command(&mut scene.ui_elements, command)
+                                }
+                                RuntimeCommand::SpawnObject {
+                                    template_object_id,
+                                    x,
+                                    y,
+                                } => {
+                                    if let Some(mut object) =
+                                        object_prototypes.get(&template_object_id).cloned()
+                                    {
+                                        let id = runtime_entity_ids.allocate();
+                                        object.id = id;
+                                        object.x = x;
+                                        object.y = y;
+                                        object.blueprint_file = format!("blueprint_{id}.json");
+                                        scene.game_objects.push(object);
+                                        objects_changed = true;
                                     }
-                                    RuntimeCommand::SpawnObject {
-                                        template_object_id,
-                                        x,
-                                        y,
-                                    } => {
-                                        spawn_commands.push((template_object_id, x, y));
-                                        None
+                                }
+                                RuntimeCommand::DestroyObject(id) => {
+                                    if scene.game_objects.iter().any(|object| object.id == id) {
+                                        scene.game_objects.retain(|object| object.id != id);
+                                        blueprint_runtime_state.remove_owner(id);
+                                        audio_engine.stop_owner(id);
+                                        objects_changed = true;
                                     }
-                                    RuntimeCommand::DestroyObject(id) => {
-                                        destroy_ids.push(id);
-                                        None
+                                }
+                                RuntimeCommand::PlaySound {
+                                    owner_id,
+                                    path,
+                                    volume,
+                                } => audio_engine.play(
+                                    owner_id,
+                                    &resolve_runtime_asset_path(&scene_directory, &path),
+                                    volume,
+                                ),
+                                RuntimeCommand::StopSound { owner_id } => {
+                                    audio_engine.stop_owner(owner_id)
+                                }
+                                RuntimeCommand::SwitchScene(name) => {
+                                    let Some(next_scene) = project.as_ref().and_then(|project| {
+                                        project.scenes.iter().find(|value| value.name == name)
+                                    }) else {
+                                        eprintln!("Runtime切换场景失败：找不到场景{name}");
+                                        return;
+                                    };
+                                    let persistent_objects: Vec<GameObject> = scene
+                                        .game_objects
+                                        .iter()
+                                        .filter(|object| object.persistent)
+                                        .cloned()
+                                        .collect();
+                                    let persistent_ui: Vec<UiElement> = scene
+                                        .ui_elements
+                                        .iter()
+                                        .filter(|element| element.persistent)
+                                        .cloned()
+                                        .collect();
+                                    let persistent_object_ids: HashSet<u64> =
+                                        persistent_objects.iter().map(|object| object.id).collect();
+                                    let persistent_ui_ids: HashSet<u64> =
+                                        persistent_ui.iter().map(|element| element.id).collect();
+                                    for object in &scene.game_objects {
+                                        if !persistent_object_ids.contains(&object.id) {
+                                            blueprint_runtime_state.remove_owner(object.id);
+                                        }
                                     }
-                                })
-                                .collect();
-                            apply_ui_commands(&mut scene.ui_elements, all_ui_commands);
-                            let objects_changed = apply_object_commands(
-                                &mut scene.game_objects,
-                                spawn_commands,
-                                destroy_ids,
-                            );
+                                    for element in &scene.ui_elements {
+                                        if !persistent_ui_ids.contains(&element.id) {
+                                            blueprint_runtime_state
+                                                .remove_owner(ui_blueprint_owner_id(element.id));
+                                        }
+                                    }
+                                    scene = next_scene.clone();
+                                    scene.game_objects.retain(|object| {
+                                        !persistent_object_ids.contains(&object.id)
+                                    });
+                                    scene
+                                        .ui_elements
+                                        .retain(|element| !persistent_ui_ids.contains(&element.id));
+                                    scene.game_objects.extend(persistent_objects);
+                                    scene.ui_elements.extend(persistent_ui);
+                                    scene.game_objects.sort_by_key(|object| object.layer_index);
+                                    object_prototypes = next_scene
+                                        .game_objects
+                                        .iter()
+                                        .cloned()
+                                        .map(|object| (object.id, object))
+                                        .collect();
+                                    runtime_entity_ids.observe(&scene.game_objects);
+                                    audio_engine.retain_owners(&persistent_object_ids);
+                                    for object in &scene.game_objects {
+                                        if !persistent_object_ids.contains(&object.id)
+                                            && !object.audio_path.is_empty()
+                                        {
+                                            audio_engine.play(
+                                                object.id,
+                                                &resolve_runtime_asset_path(
+                                                    &scene_directory,
+                                                    &object.audio_path,
+                                                ),
+                                                1.0,
+                                            );
+                                        }
+                                    }
+                                    blueprint_input.scene_just_loaded = true;
+                                    objects_changed = true;
+                                    scene_changed = true;
+                                }
+                            });
                             if objects_changed {
                                 runtime_textures = load_runtime_textures(
                                     &device,
@@ -782,6 +1011,23 @@ fn run_window(
                                     &scene.game_objects,
                                     &scene_directory,
                                 );
+                                if scene_changed {
+                                    runtime_tileset = load_runtime_tileset(
+                                        &device,
+                                        &queue,
+                                        &texture_bind_group_layout,
+                                        &scene.tile_map,
+                                        &scene_directory,
+                                    );
+                                    runtime_tile_buffers = create_tile_buffers(
+                                        &device,
+                                        &scene.tile_map,
+                                        runtime_tileset.as_ref(),
+                                        &surface_config,
+                                        scale_factor,
+                                        &performance_settings,
+                                    );
+                                }
                                 physics_world = PhysicsWorld::new(&scene.game_objects);
                                 if let Some(runtime_tileset) = &runtime_tileset {
                                     physics_world.add_tile_colliders(
@@ -791,21 +1037,9 @@ fn run_window(
                                     );
                                 }
                             }
-                            if let Some(scene_name) = switch_scene_name {
-                                if let Some(project_path) = &project_path {
-                                    if launch_switched_scene(
-                                        project_path,
-                                        &scene_name,
-                                        &global_variables,
-                                    )
-                                    .is_ok()
-                                    {
-                                        event_loop_window_target.exit();
-                                        return;
-                                    }
-                                }
+                            if !scene_changed {
+                                blueprint_input.scene_just_loaded = false;
                             }
-                            blueprint_input.scene_just_loaded = false;
                             // 蓝图先提出移动需求，再让Rapier在同一帧进行瓦片碰撞求解。
                             // 渲染使用物理修正后的坐标，因此玩家不会直接穿过碰撞瓦片。
                             let physics_started = Instant::now();
@@ -813,8 +1047,8 @@ fn run_window(
                                 elapsed_seconds,
                                 &mut scene.game_objects,
                                 &movement_requests,
-                                surface_config.width as f32,
-                                surface_config.height as f32,
+                                logical_width,
+                                logical_height,
                                 &performance_settings,
                             );
                             let physics_time_ms = physics_started.elapsed().as_secs_f32() * 1000.0;
@@ -855,8 +1089,8 @@ fn run_window(
                                     count_visible_runtime_items(
                                         &scene.game_objects,
                                         &scene.tile_map,
-                                        surface_config.width as f32,
-                                        surface_config.height as f32,
+                                        logical_width,
+                                        logical_height,
                                         &performance_settings,
                                     );
                                 write_runtime_performance_report(RuntimePerformanceReport {
@@ -957,20 +1191,20 @@ fn draw_runtime_frame(
         Err(_) => return,
     };
     let mut object_buffers = Vec::new();
+    let (logical_width, logical_height) = logical_viewport(
+        surface_config.width,
+        surface_config.height,
+        pixels_per_point,
+    );
     let visible_objects: Vec<&GameObject> = game_objects
         .iter()
         .filter(|object| {
             !performance_settings.viewport_culling
-                || runtime_object_visible(
-                    object,
-                    surface_config.width as f32,
-                    surface_config.height as f32,
-                )
+                || runtime_object_visible(object, logical_width, logical_height)
         })
         .collect();
     for game_object in &visible_objects {
-        let vertices =
-            create_object_vertices(game_object, surface_config.width, surface_config.height);
+        let vertices = create_object_vertices(game_object, logical_width, logical_height);
         object_buffers.push(
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Slide2D Object Vertices"),
@@ -1241,35 +1475,56 @@ fn load_runtime_egui_texture(
     Some(texture)
 }
 
-/// 应用蓝图VM输出的UI命令。
-fn apply_ui_commands(elements: &mut [UiElement], commands: Vec<UiCommand>) {
+/// 按VM生成顺序逐条提交Runtime命令。
+fn submit_runtime_commands(commands: Vec<RuntimeCommand>, mut submit: impl FnMut(RuntimeCommand)) {
     for command in commands {
-        match command {
-            UiCommand::SetText { ui_id, content } => {
-                if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
-                    match &mut element.kind {
-                        UiElementKind::Text { content: text, .. } => *text = content,
-                        UiElementKind::Button { text } => *text = content,
-                        _ => {}
-                    }
+        submit(command);
+    }
+}
+
+/// 将本次固定步接触集合转换为仅包含新接触的CollisionStarted集合。
+fn take_started_contacts<T>(previous: &mut HashSet<T>, current: HashSet<T>) -> HashSet<T>
+where
+    T: Copy + Eq + Hash,
+{
+    let started = current.difference(previous).copied().collect();
+    *previous = current;
+    started
+}
+
+/// 把winit物理像素尺寸统一转换为蓝图和物理使用的逻辑尺寸。
+fn logical_viewport(width: u32, height: u32, scale_factor: f32) -> (f32, f32) {
+    let scale_factor = scale_factor.max(f32::EPSILON);
+    (width as f32 / scale_factor, height as f32 / scale_factor)
+}
+
+/// 应用蓝图VM输出的一条UI命令。
+fn apply_ui_command(elements: &mut [UiElement], command: UiCommand) {
+    match command {
+        UiCommand::SetText { ui_id, content } => {
+            if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
+                match &mut element.kind {
+                    UiElementKind::Text { content: text, .. } => *text = content,
+                    UiElementKind::Button { text } => *text = content,
+                    _ => {}
                 }
             }
-            UiCommand::SetProgress { ui_id, value } => {
-                if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
-                    if let UiElementKind::ProgressBar {
-                        maximum,
-                        value: current,
-                        ..
-                    } = &mut element.kind
-                    {
-                        *current = value.clamp(0.0, maximum.max(0.0));
-                    }
+        }
+        UiCommand::SetProgress { ui_id, value } => {
+            if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
+                if let UiElementKind::ProgressBar {
+                    maximum,
+                    value: current,
+                    ..
+                } = &mut element.kind
+                {
+                    *current = value.clamp(0.0, maximum.max(0.0));
                 }
             }
-            UiCommand::SetVisible { ui_id, visible } => {
-                if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
-                    element.visible = visible;
-                }
+        }
+        UiCommand::SetVisible { ui_id, visible } => {
+            if let Some(element) = elements.iter_mut().find(|element| element.id == ui_id) {
+                element.visible = visible;
             }
         }
     }
@@ -1289,63 +1544,6 @@ fn find_clicked_objects(game_objects: &[GameObject], x: f32, y: f32) -> HashSet<
     object
         .map(|value| HashSet::from([value.id]))
         .unwrap_or_default()
-}
-
-/// 在一帧结束时生成或销毁物体，避免蓝图遍历期间修改数组。
-fn apply_object_commands(
-    game_objects: &mut Vec<GameObject>,
-    spawn_commands: Vec<(u64, f32, f32)>,
-    destroy_ids: Vec<u64>,
-) -> bool {
-    let changed = !spawn_commands.is_empty() || !destroy_ids.is_empty();
-    game_objects.retain(|object| !destroy_ids.contains(&object.id));
-    let mut next_id = game_objects
-        .iter()
-        .map(|object| object.id)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let templates = game_objects.clone();
-    for (template_id, x, y) in spawn_commands {
-        if let Some(mut object) = templates
-            .iter()
-            .find(|object| object.id == template_id)
-            .cloned()
-        {
-            object.id = next_id;
-            object.x = x;
-            object.y = y;
-            object.blueprint_file = format!("blueprint_{next_id}.json");
-            game_objects.push(object);
-            next_id += 1;
-        }
-    }
-    changed
-}
-
-/// 启动同一工程的目标场景，旧Runtime随后安全退出。
-fn launch_switched_scene(
-    project_path: &str,
-    scene_name: &str,
-    global_variables: &HashMap<String, f32>,
-) -> Result<(), String> {
-    let executable =
-        std::env::current_exe().map_err(|error| format!("定位Runtime失败：{error}"))?;
-    std::process::Command::new(executable)
-        .arg("--runtime")
-        .arg(project_path)
-        .arg("--scene")
-        .arg(scene_name)
-        .arg("--locale")
-        .arg(crate::localization::current_language().code())
-        .arg("--globals")
-        .arg(
-            serde_json::to_string(global_variables)
-                .map_err(|error| format!("保存全局变量失败：{error}"))?,
-        )
-        .spawn()
-        .map_err(|error| format!("切换场景失败：{error}"))?;
-    Ok(())
 }
 
 /// 转换序列化RGBA颜色为egui颜色。
@@ -1415,12 +1613,15 @@ fn create_tile_buffers(
     tile_map: &TileMap,
     runtime_tileset: Option<&RuntimeTileSet>,
     surface_config: &wgpu::SurfaceConfiguration,
+    scale_factor: f32,
     performance_settings: &PerformanceSettings,
 ) -> Vec<wgpu::Buffer> {
     let runtime_tileset = match runtime_tileset {
         Some(tileset) => tileset,
         None => return Vec::new(),
     };
+    let (logical_width, logical_height) =
+        logical_viewport(surface_config.width, surface_config.height, scale_factor);
     let mut buffers = Vec::new();
     for layer in &tile_map.layers {
         if !layer.visible {
@@ -1432,8 +1633,8 @@ fn create_tile_buffers(
                     cell.x,
                     cell.y,
                     tile_map,
-                    surface_config.width as f32,
-                    surface_config.height as f32,
+                    logical_width,
+                    logical_height,
                 )
             {
                 continue;
@@ -1452,8 +1653,8 @@ fn create_tile_buffers(
                 cell.x,
                 cell.y,
                 cell.tile_id,
-                surface_config.width,
-                surface_config.height,
+                logical_width,
+                logical_height,
             );
             buffers.push(
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1572,8 +1773,8 @@ fn create_tile_vertices(
     tile_x: i32,
     tile_y: i32,
     tile_id: u32,
-    width: u32,
-    height: u32,
+    width: f32,
+    height: f32,
 ) -> [Vertex; 6] {
     let x = tile_x as f32 * tile_map.tile_width as f32;
     let y = tile_y as f32 * tile_map.tile_height as f32;
@@ -1779,7 +1980,7 @@ fn load_runtime_animation(
 }
 
 /// 将一个矩形物体转换为带完整UV坐标的两个三角形。
-fn create_object_vertices(game_object: &GameObject, width: u32, height: u32) -> [Vertex; 6] {
+fn create_object_vertices(game_object: &GameObject, width: f32, height: f32) -> [Vertex; 6] {
     let left = pixel_to_clip_x(game_object.x, width);
     let right = pixel_to_clip_x(game_object.x + game_object.width, width);
     let top = pixel_to_clip_y(game_object.y, height);
@@ -1872,51 +2073,6 @@ fn load_runtime_textures(
     textures
 }
 
-/// 播放场景中的全部音效物体，并保持系统音频输出流存活。
-fn play_scene_audio(
-    game_objects: &[GameObject],
-    scene_directory: &std::path::Path,
-) -> Option<OutputStream> {
-    let (stream, stream_handle) = match OutputStream::try_default() {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("无法打开默认音频设备：{error}");
-            return None;
-        }
-    };
-
-    for game_object in game_objects {
-        if game_object.audio_path.is_empty() {
-            continue;
-        }
-        let audio_path = resolve_runtime_asset_path(scene_directory, &game_object.audio_path);
-        let file = match std::fs::File::open(&audio_path) {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!("打开音效失败：{}，错误：{error}", audio_path.display());
-                continue;
-            }
-        };
-        let decoder = match Decoder::new(std::io::BufReader::new(file)) {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                eprintln!("解码音效失败：{}，错误：{error}", audio_path.display());
-                continue;
-            }
-        };
-        let sink = match Sink::try_new(&stream_handle) {
-            Ok(sink) => sink,
-            Err(error) => {
-                eprintln!("创建音效播放器失败：{error}");
-                continue;
-            }
-        };
-        sink.append(decoder);
-        sink.detach();
-    }
-    Some(stream)
-}
-
 /// 将场景中的相对图片路径解析为相对于scenes.json的路径。
 fn resolve_runtime_asset_path(
     scene_directory: &std::path::Path,
@@ -1997,11 +2153,96 @@ fn create_runtime_texture(
 }
 
 /// 将水平像素坐标转换为wgpu使用的-1到1裁剪空间坐标。
-fn pixel_to_clip_x(pixel_x: f32, window_width: u32) -> f32 {
-    pixel_x / window_width.max(1) as f32 * 2.0 - 1.0
+fn pixel_to_clip_x(pixel_x: f32, window_width: f32) -> f32 {
+    pixel_x / window_width.max(1.0) * 2.0 - 1.0
 }
 
 /// 将向下增长的垂直像素坐标转换为wgpu裁剪空间坐标。
-fn pixel_to_clip_y(pixel_y: f32, window_height: u32) -> f32 {
-    1.0 - pixel_y / window_height.max(1) as f32 * 2.0
+fn pixel_to_clip_y(pixel_y: f32, window_height: f32) -> f32 {
+    1.0 - pixel_y / window_height.max(1.0) * 2.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_commands_are_submitted_in_original_order() {
+        let commands = vec![
+            RuntimeCommand::DestroyObject(1),
+            RuntimeCommand::SpawnObject {
+                template_object_id: 2,
+                x: 0.0,
+                y: 0.0,
+            },
+            RuntimeCommand::StopSound { owner_id: 3 },
+            RuntimeCommand::SwitchScene("next".to_owned()),
+        ];
+        let mut submitted = Vec::new();
+
+        submit_runtime_commands(commands, |command| {
+            submitted.push(match command {
+                RuntimeCommand::DestroyObject(_) => "destroy",
+                RuntimeCommand::SpawnObject { .. } => "spawn",
+                RuntimeCommand::StopSound { .. } => "audio",
+                RuntimeCommand::SwitchScene(_) => "scene",
+                _ => "other",
+            });
+        });
+
+        assert_eq!(submitted, ["destroy", "spawn", "audio", "scene"]);
+    }
+
+    #[test]
+    fn runtime_entity_ids_are_never_reused() {
+        let mut ids = RuntimeEntityIds { next: 8 };
+
+        assert_eq!(ids.allocate(), 8);
+        ids.observe(&[]);
+        assert_eq!(ids.allocate(), 9);
+        ids.observe(&[test_object(2)]);
+        assert_eq!(ids.allocate(), 10);
+        ids.observe(&[test_object(20)]);
+        assert_eq!(ids.allocate(), 21);
+    }
+
+    #[test]
+    fn collision_started_only_reports_new_contacts() {
+        let mut previous = HashSet::new();
+
+        assert_eq!(
+            take_started_contacts(&mut previous, HashSet::from([(1, 2)])),
+            HashSet::from([(1, 2)])
+        );
+        assert!(take_started_contacts(&mut previous, HashSet::from([(1, 2)])).is_empty());
+        assert_eq!(
+            take_started_contacts(&mut previous, HashSet::from([(1, 2), (2, 3)])),
+            HashSet::from([(2, 3)])
+        );
+        assert!(take_started_contacts(&mut previous, HashSet::new()).is_empty());
+        assert_eq!(
+            take_started_contacts(&mut previous, HashSet::from([(1, 2)])),
+            HashSet::from([(1, 2)])
+        );
+    }
+
+    fn test_object(id: u64) -> GameObject {
+        GameObject {
+            id,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            layer_index: 0,
+            image_path: String::new(),
+            audio_path: String::new(),
+            animation_path: String::new(),
+            animation_playing: true,
+            collider: None,
+            blueprint: Default::default(),
+            blueprint_file: String::new(),
+            variables: HashMap::new(),
+            persistent: false,
+        }
+    }
 }
